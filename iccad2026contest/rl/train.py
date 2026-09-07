@@ -57,10 +57,11 @@ def iter_training_instances(data_path: str = "../"):
         loader = get_training_dataloader(data_path=data_path, batch_size=1, shuffle=True)
         while True:
             for batch in loader:
-                area_target, b2b_conn, p2b_conn, pins_pos, constraints, _, _, metrics = batch
+                area_target, b2b_conn, p2b_conn, pins_pos, constraints, _, fp_sol, metrics = batch
                 yield from_training_batch_item(
                     area_target.squeeze(0), b2b_conn.squeeze(0), p2b_conn.squeeze(0),
                     pins_pos.squeeze(0), constraints.squeeze(0), metrics.squeeze(0),
+                    fp_sol.squeeze(0),
                 )
     else:
         print("NOTE: 1M-sample training set (floorset_lite/) not found -- "
@@ -130,11 +131,21 @@ def main():
         avg_reward = sum(e.reward for e in episodes) / len(episodes)
         print(f"iter {it}/{args.iterations} blocks={inst.block_count} "
               f"avg_reward={avg_reward:.4f} loss={stats['loss']:.4f} "
-              f"elapsed={time.time() - t0:.1f}s")
+              f"grad_norm={stats['grad_norm']:.4f} elapsed={time.time() - t0:.1f}s")
 
         if it % args.checkpoint_every == 0 or it == args.iterations:
             torch.save(net.state_dict(), args.checkpoint)
-            print(f"  saved checkpoint -> {args.checkpoint}")
+            # Versioned snapshot alongside the canonical "latest" path above
+            # (which my_optimizer.py and --resume always load): a training
+            # run that suddenly destabilizes (see module docstring history --
+            # an overnight run's fallback rate jumped from ~3% to ~29%+ and
+            # never recovered) would otherwise have already overwritten the
+            # last healthy state by the time anyone notices.
+            history_dir = os.path.join(ckpt_dir or ".", "history")
+            os.makedirs(history_dir, exist_ok=True)
+            snapshot_path = os.path.join(history_dir, f"policy_iter{it:06d}.pt")
+            torch.save(net.state_dict(), snapshot_path)
+            print(f"  saved checkpoint -> {args.checkpoint} (+ {snapshot_path})")
 
 
 if __name__ == "__main__":

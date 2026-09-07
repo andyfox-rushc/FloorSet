@@ -169,6 +169,7 @@ def ppo_update(
     reward_approx_coef: float = 0.5,
     entropy_coef: float = 0.01,
     epochs: int = 4,
+    max_grad_norm: float = 1.0,
 ) -> dict:
     last_stats = {}
     for _ in range(epochs):
@@ -220,6 +221,11 @@ def ppo_update(
                 + reward_approx_coef * reward_loss_sum
                 - entropy_coef * entropy_sum) / count
         loss.backward()
+        # Guards against the kind of sudden PPO instability found in an
+        # overnight run (fallback rate jumped from ~3% to ~29%+ within a few
+        # hundred iterations, never recovering): an occasional large/noisy
+        # gradient pushing the policy into a degenerate, overconfident state.
+        grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
         optimizer.step()
         last_stats = {
             'loss': loss.item(),
@@ -227,5 +233,6 @@ def ppo_update(
             'value_loss': (value_loss_sum / count).item(),
             'reward_approx_loss': (reward_loss_sum / count).item(),
             'entropy': (entropy_sum / count).item(),
+            'grad_norm': float(grad_norm),
         }
     return last_stats

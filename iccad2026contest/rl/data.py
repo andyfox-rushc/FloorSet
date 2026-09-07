@@ -74,20 +74,37 @@ def from_training_batch_item(
     pins_pos: torch.Tensor,
     constraints: torch.Tensor,
     metrics: torch.Tensor,
+    fp_sol: torch.Tensor,
 ) -> FloorplanInstance:
     """Build a FloorplanInstance from one (already batch-squeezed) training
     sample. `metrics` format: [area, num_pins, num_total_nets, num_b2b_nets,
-    num_p2b_nets, num_hardconstraints, b2b_weighted_wl, p2b_weighted_wl]."""
+    num_p2b_nets, num_hardconstraints, b2b_weighted_wl, p2b_weighted_wl].
+    `fp_sol` is [n_blocks, 4] = (w, h, x, y) ground truth -- used to populate
+    exact target dimensions/position for fixed-shape and preplaced blocks
+    (mirrors what from_validation_sample does from the validation set's own
+    ground truth). Without this, fixed-shape blocks would report w=h=-1
+    (the "free" placeholder), which is nonsense geometry, not a legitimate
+    free-block shape -- confirmed the whole real-training-set pretraining
+    run silently scored ~infeasible on nearly every episode because of
+    exactly this."""
     block_count = int((area_target != -1).sum().item())
     baseline = {
         'hpwl_baseline': float(metrics[6] + metrics[7]),
         'area_baseline': float(metrics[0]),
     }
     target_positions = torch.full((block_count, 4), -1.0)
-    # Training data does not expose per-block target (x, y, w, h) the way the
-    # validation loader does; fixed/preplaced dimension immutability is
-    # enforced against target_positions during evaluation only, so for
-    # training-time reward this is left free (-1). See rl/reward.py.
+    nc = constraints.shape[1] if constraints.dim() > 1 else 0
+    for i in range(block_count):
+        is_fixed = nc > 0 and constraints[i, 0] != 0
+        is_preplaced = nc > 1 and constraints[i, 1] != 0
+        if not (is_fixed or is_preplaced):
+            continue
+        w, h, x, y = fp_sol[i].tolist()
+        if is_preplaced:
+            target_positions[i] = torch.tensor([x, y, w, h])
+        else:
+            target_positions[i, 2] = w
+            target_positions[i, 3] = h
     return FloorplanInstance(
         block_count=block_count,
         area_targets=area_target[:block_count].clone(),

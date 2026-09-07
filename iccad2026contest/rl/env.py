@@ -14,7 +14,16 @@ Guarantees:
     - Fixed/preplaced dimensions: taken verbatim from target_positions,
                 never altered by an action.
     - MIB:      only the first-placed ("leader") member of a group chooses
-                a shape; every other member copies it exactly.
+                a shape; every other member copies it exactly -- UNLESS its
+                own area target isn't within the 1% hard-constraint
+                tolerance of the leader's shape (real data does have MIB
+                groups whose members carry different target areas; the two
+                requirements are then mathematically incompatible, since
+                exact-copy would break the follower's own hard area
+                constraint). In that case the follower keeps the leader's
+                aspect ratio (best-effort MIB similarity) but sizes itself
+                to its own area target, so the hard constraint always wins
+                over the soft one.
     - Boundary: the coordinate(s) implied by the required edge bit(s) are
                 pinned to the working canvas edge, which nothing can ever
                 extend past -- guaranteed *unless* the pinned cell is
@@ -37,6 +46,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from iccad2026_evaluate import AREA_TOLERANCE
 
 from .data import FloorplanInstance
 from .ordering import PlacementStep, compute_order
@@ -185,7 +196,16 @@ class GridPlacementEnv:
             tp = self.instance.target_positions[i]
             return float(tp[2]), float(tp[3])
         if step.role == 'mib_follower':
-            return self.mib_shape[step.mib_leader]
+            leader_w, leader_h = self.mib_shape[step.mib_leader]
+            own_area = float(self.instance.area_targets[i])
+            leader_area = leader_w * leader_h
+            if own_area > 0 and abs(leader_area - own_area) / own_area <= AREA_TOLERANCE:
+                return leader_w, leader_h
+            # Own area target is incompatible with an exact copy (see module
+            # docstring): keep the leader's aspect ratio, but size to this
+            # block's own area so its hard area constraint still holds.
+            aspect = leader_w / leader_h
+            return math.sqrt(own_area * aspect), math.sqrt(own_area / aspect)
         raise ValueError(f"current_shape() called for role={step.role}; call choose_aspect() first")
 
     def choose_aspect(self, aspect_idx: int) -> Tuple[float, float]:
