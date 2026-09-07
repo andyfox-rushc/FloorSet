@@ -106,6 +106,71 @@ cd /home/afox/floorplan/FloorSet/iccad2026contest
 source ../venv/bin/activate
 ```
 
+If that venv doesn't exist yet, see "Setting up Python and the virtual
+environment" below to create it -- it's a one-time step.
+
+### Setting up Python and the virtual environment
+
+This only needs doing once. The venv lives at `FloorSet/venv/` (one level
+above `iccad2026contest/`), separate from the system Python.
+
+**1. Check Python is available.** Python 3.10+ works; this was set up
+against 3.14.
+
+```bash
+python3 --version
+```
+
+**2. Make sure the `venv` module is actually installable.** On some
+Debian/Ubuntu systems the standard library's `venv` module is split into a
+separate package and isn't there by default. If step 3 fails with
+"ensurepip is not available", install it (this needs `sudo`, so run it
+yourself if the assistant can't):
+
+```bash
+sudo apt install -y python3.14-venv   # match your python3 --version
+```
+
+**3. Create the virtual environment and activate it:**
+
+```bash
+cd /home/afox/floorplan/FloorSet
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+Don't skip the venv and `pip install` directly with the system Python --
+modern Debian/Ubuntu Pythons refuse this on purpose ("externally-managed-
+environment", PEP 668), and forcing it with `--break-system-packages` risks
+breaking the system Python install. The venv sidesteps the whole issue.
+
+**4. Install the project's dependencies, plus `pytest` for the test suite:**
+
+```bash
+pip install -r iccad2026contest/requirements.txt pytest
+```
+
+This pulls in torch, numpy, shapely, matplotlib, tqdm, and requests. On a
+CPU-only machine the default `pip install torch` still pulls the CUDA
+wheels along with it (several GB of unused NVIDIA packages) -- harmless,
+just a bigger download than strictly necessary; torch itself correctly
+falls back to CPU at runtime.
+
+**5. Verify it worked:**
+
+```bash
+python -c "import torch, numpy, shapely, matplotlib, tqdm, requests, pytest; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+```
+
+Should print a torch version and `cuda False` (or `True` if you actually
+have a GPU set up). From here on, every session just needs:
+
+```bash
+cd /home/afox/floorplan/FloorSet/iccad2026contest
+source ../venv/bin/activate
+```
+
 ### Tests
 
 ```bash
