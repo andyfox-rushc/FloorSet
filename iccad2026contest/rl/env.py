@@ -32,12 +32,15 @@ Guarantees:
                 `boundary_fallback_count`) rather than risk an overlap.
     - Grouping: not fully guaranteed (order-dependent across blocks already
                 placed for *other* clusters), but any cluster member after
-                the first attempts an exact geometric touch against an
-                already-placed clustermate (checked against true placed
-                rectangles, not the conservative grid, so this can never
-                introduce an overlap); if no safe touch exists it falls back
-                to an adjacency-preferring masked position, then to a plain
-                free mask.
+                the first searches every grid-aligned exact geometric touch
+                against an already-placed clustermate (checked against true
+                placed rectangles, not the conservative grid, so this can
+                never introduce an overlap -- see _try_cluster_touch); if no
+                safe touch exists anywhere along any clustermate's edges it
+                falls back to an adjacency-preferring masked position, then
+                to a plain free mask -- both of which are grid-dilation
+                based and can select a merely-nearby (even corner-only)
+                cell that doesn't actually count as touching.
 """
 
 import math
@@ -53,10 +56,10 @@ from .data import FloorplanInstance
 from .ordering import PlacementStep, compute_order
 
 DEFAULT_GRID_DIM = 48
-# Generous slack: the working canvas is never what gets scored (the scored
-# bbox is the tight box around actually-placed blocks), so extra room here
-# only helps packing succeed -- it doesn't inflate the final area cost.
-CANVAS_PADDING = 2.2
+# Slack beyond total block area for placement to always fit. Was 2.2
+# (~4.84x area) -- an undertrained policy's bbox matched that ceiling almost
+# exactly instead of packing tight; 1.5 (~2.25x) halves the free spreading room.
+CANVAS_PADDING = 1.5
 # Log-spaced aspect ratio buckets (w/h); index 4 == square.
 ASPECT_RATIOS = [0.2, 0.3, 0.45, 0.67, 1.0, 1.5, 2.22, 3.33, 5.0]
 
@@ -120,6 +123,32 @@ class GridPlacementEnv:
         self.boundary_fallback_count = 0
         self.grouping_fallback_count = 0
 
+        # Adjacency for wiremask() -- built once so each step's wiremask
+        # computation is just a lookup, not a rescan of every edge.
+        self._b2b_adj: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+        b2b = inst.b2b_connectivity
+        if b2b is not None and b2b.numel() > 0:
+            valid = b2b[b2b[:, 0] >= 0]
+            for edge in valid:
+                i, j, wt = int(edge[0]), int(edge[1]), float(edge[2])
+                self._b2b_adj[i].append((j, wt))
+                self._b2b_adj[j].append((i, wt))
+        self._p2b_adj: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+        p2b = inst.p2b_connectivity
+        if p2b is not None and p2b.numel() > 0:
+            valid = p2b[p2b[:, 0] >= 0]
+            for edge in valid:
+                pin_idx, block_idx, wt = int(edge[0]), int(edge[1]), float(edge[2])
+                self._p2b_adj[block_idx].append((pin_idx, wt))
+
+        # Running bbox over placed content only (not the canvas) -- seeded
+        # from preplaced blocks so the first pending block's step_deltas()
+        # doesn't get blamed for area that was already fixed before the
+        # rollout started. None means "nothing placed yet".
+        self._bbox: Optional[List[float]] = None
+        self._resolved_wl = 0.0
+        self.last_step_deltas: Tuple[float, float] = (0.0, 0.0)
+
         for i in range(n):
             if preplaced_mask[i]:
                 x, y, w, h = [float(v) for v in inst.target_positions[i].tolist()]
@@ -128,6 +157,7 @@ class GridPlacementEnv:
                 cid = int(cluster_col[i])
                 if cid:
                     self._mark_cluster(cid, x, y, w, h)
+                self._grow_bbox(x, y, w, h)
 
         self._pending = [s for s in self.plan.order if s.role != 'preplaced']
         self._cursor = 0
@@ -166,6 +196,24 @@ class GridPlacementEnv:
         for gy in range(gy0, gy1):
             for gx in range(gx0, gx1):
                 self.cluster_cells[cid].add((gy, gx))
+
+    def _grow_bbox(self, x, y, w, h) -> float:
+        """Extends the running placed-content bbox to include (x,y,w,h);
+        returns the resulting area *increase* (bbox area only ever grows as
+        points are added, so this is always >= 0). Used by _commit() to
+        attribute the exact, causal share of final bbox_area to the step
+        that caused it -- see rl/reward.py's _step_quality_delta."""
+        x1, y1 = x + w, y + h
+        if self._bbox is None:
+            self._bbox = [x, y, x1, y1]
+            return (x1 - x) * (y1 - y)
+        old_area = (self._bbox[2] - self._bbox[0]) * (self._bbox[3] - self._bbox[1])
+        self._bbox[0] = min(self._bbox[0], x)
+        self._bbox[1] = min(self._bbox[1], y)
+        self._bbox[2] = max(self._bbox[2], x1)
+        self._bbox[3] = max(self._bbox[3], y1)
+        new_area = (self._bbox[2] - self._bbox[0]) * (self._bbox[3] - self._bbox[1])
+        return new_area - old_area
 
     def _footprint_cells(self, w, h):
         cells_w = min(self.grid_dim, max(1, math.ceil(w / self.cell_w - 1e-9)))
@@ -265,7 +313,21 @@ class GridPlacementEnv:
             if self.cluster_cells.get(cid):
                 self.grouping_fallback_count += 1
 
+        # Soft compactness preference: cells touching any already-placed
+        # block, before falling back to the fully unrestricted free mask --
+        # a strict subset of `free`, so this can only narrow the candidate
+        # set, never introduce an illegal position.
+        compact = self._compactness_mask(free, cells_w, cells_h)
+        if bool(compact.any()):
+            return compact, cells_w, cells_h
         return free, cells_w, cells_h
+
+    def _compactness_mask(self, free, cells_w, cells_h):
+        dilated = F.max_pool2d(self.occupancy.unsqueeze(0).unsqueeze(0),
+                                kernel_size=3, stride=1, padding=1)[0, 0]
+        kernel = torch.ones(1, 1, cells_h, cells_w)
+        window_sum = F.conv2d(dilated.unsqueeze(0).unsqueeze(0), kernel)[0, 0]
+        return (window_sum > 0) & free
 
     def _boundary_mask(self, free, cells_w, cells_h, code):
         out_h, out_w = free.shape
@@ -300,31 +362,114 @@ class GridPlacementEnv:
         window_sum = F.conv2d(dilated.unsqueeze(0).unsqueeze(0), kernel)[0, 0]
         return (window_sum > 0) & free
 
+    def wiremask(self, w: float, h: float) -> torch.Tensor:
+        """[grid_dim, grid_dim] channel giving the current block's placement
+        head a direct spatial HPWL signal, which occupancy/cluster_grid
+        alone don't provide (see rl/networks.py's PositionCNN docstring):
+        at each candidate top-left cell, the weighted-Manhattan wirelength
+        cost of centering the block there against every already-placed
+        connected block/pin -- the exact same b2b/p2b formula
+        iccad2026_evaluate.py scores with (calculate_hpwl_b2b/_p2b), for
+        just the portion of each net that's resolved so far.
+
+        Manhattan distance separates additively into independent x and y
+        terms, so this is two O(grid_dim) sweeps against an outer sum
+        rather than an O(grid_dim^2) loop over cells.
+        """
+        i = self.current_step().block_idx
+        targets_x: List[Tuple[float, float]] = []  # (target x, weight)
+        targets_y: List[Tuple[float, float]] = []
+        for j, wt in self._b2b_adj.get(i, []):
+            pos = self.positions[j]
+            if pos is not None:
+                targets_x.append((pos[0] + pos[2] / 2, wt))
+                targets_y.append((pos[1] + pos[3] / 2, wt))
+        for pin_idx, wt in self._p2b_adj.get(i, []):
+            px, py = self.instance.pins_pos[pin_idx].tolist()
+            targets_x.append((float(px), wt))
+            targets_y.append((float(py), wt))
+
+        if not targets_x:
+            return torch.zeros(self.grid_dim, self.grid_dim)
+
+        cells = torch.arange(self.grid_dim, dtype=torch.float32)
+        cell_x = self.x_min + cells * self.cell_w + w / 2
+        cell_y = self.y_min + cells * self.cell_h + h / 2
+
+        fx = torch.zeros(self.grid_dim)
+        for tx, wt in targets_x:
+            fx += wt * (cell_x - tx).abs()
+        fy = torch.zeros(self.grid_dim)
+        for ty, wt in targets_y:
+            fy += wt * (cell_y - ty).abs()
+
+        cost = fy.unsqueeze(1) + fx.unsqueeze(0)  # [gy, gx]
+        # Per-step normalized attraction into [0, 1] (higher = better): raw
+        # weighted distances have no fixed scale across instances/edge
+        # weights, but relative-to-this-step's-own-spread does. Normalizing
+        # by the canvas-dimension sum instead (as this used to) crushed
+        # values down to ~1e-3, two orders of magnitude below the
+        # occupancy/cluster_grid channels' 0-1 range and too faint to
+        # compete with them in PositionCNN's conv1 -- see algorithm.md.
+        spread = max((cost.max() - cost.min()).item(), 1e-6)
+        return (cost.max() - cost) / spread
+
+    def _grid_values(self, lo: float, hi: float, step: float, anchor: float):
+        """Grid-aligned coordinate values (anchor + k*step) in [lo, hi],
+        closest-to-anchor first -- used by _try_cluster_touch to search
+        every legal touching offset along a shared edge, not just the one
+        implied by the neighbor's own position (see its docstring)."""
+        if hi < lo - 1e-9 or step <= 0:
+            return
+        k_lo = math.ceil((lo - anchor) / step - 1e-9)
+        k_hi = math.floor((hi - anchor) / step + 1e-9)
+        for k in range(k_lo, k_hi + 1):
+            yield anchor + k * step
+
     def _try_cluster_touch(self, cid, w, h):
+        """Exact geometric touch against an already-placed clustermate --
+        see the module docstring's Grouping guarantee.
+
+        For each neighbor and each of the 4 sides, the set of positions
+        that would produce a genuine (positive-length, not just corner)
+        touch is a whole *range* along the shared edge, not the single
+        offset implied by copying the neighbor's own coordinate: any y
+        where [y, y+h] overlaps [ny, ny+nh] gives a real right/left touch,
+        and symmetrically for x on the top/bottom sides. Only trying the
+        one clamped offset (the previous version) meant a single collision
+        there gave up on that neighbor entirely and fell through to
+        rl/env.py's imprecise, grid-dilation-based adjacency mask -- which
+        can select a merely-nearby (even corner-only) cell that position_mask()
+        allows but evaluate_solution's real connected-components check
+        does not count as touching, showing up as a `grouping_violations`
+        soft-constraint hit with no corresponding `grouping_fallback_count`
+        (diagnosed 2026-09-13: violations were consistently several times
+        higher than the fallback counter, which this exhaustive search
+        directly targets). Trying every grid-aligned offset along that
+        range before moving to the next neighbor/side finds a real touch
+        far more often, without ever weakening the overlap check itself."""
         n = self.instance.block_count
         ncols = self.instance.constraints.shape[1]
         cluster_col = self.instance.constraints[:, 3] if ncols > 3 else torch.zeros(n)
         neighbors = [self.positions[j] for j in range(n)
                      if self.positions[j] is not None and int(cluster_col[j]) == cid]
         for (nx, ny, nw, nh) in neighbors:
-            # For a horizontal touch (left/right), the touching x-coordinate
-            # is exact; the free y-coordinate is clamped into canvas bounds
-            # rather than copied verbatim from the neighbor, since [ny, ny+nh]
-            # and [y_min, y_max] both contain ny, this clamp is guaranteed to
-            # still overlap [ny, ny+nh] (i.e. still a real touch) -- see
-            # env.py module docstring for the general argument. Symmetric for
-            # vertical touches (top/bottom).
-            cy_h = min(max(ny, self.y_min), self.y_max - h)
-            cx_v = min(max(nx, self.x_min), self.x_max - w)
-            for (cx, cy) in ((nx + nw, cy_h), (nx - w, cy_h), (cx_v, ny + nh), (cx_v, ny - h)):
+            y_lo, y_hi = max(self.y_min, ny - h), min(self.y_max - h, ny + nh)
+            for cx in (nx + nw, nx - w):
                 if cx < self.x_min - 1e-9 or cx + w > self.x_max + 1e-9:
                     continue
+                for cy in self._grid_values(y_lo, y_hi, self.cell_h, ny):
+                    candidate = (cx, cy, w, h)
+                    if not any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
+                        return cx, cy
+            x_lo, x_hi = max(self.x_min, nx - w), min(self.x_max - w, nx + nw)
+            for cy in (ny + nh, ny - h):
                 if cy < self.y_min - 1e-9 or cy + h > self.y_max + 1e-9:
                     continue
-                candidate = (cx, cy, w, h)
-                if any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
-                    continue
-                return cx, cy
+                for cx in self._grid_values(x_lo, x_hi, self.cell_w, nx):
+                    candidate = (cx, cy, w, h)
+                    if not any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
+                        return cx, cy
         return None
 
     def _commit(self, x, y, w, h):
@@ -338,8 +483,30 @@ class GridPlacementEnv:
             self.mib_shape[i] = (w, h)
         if step.cluster_id:
             self._mark_cluster(step.cluster_id, x, y, w, h)
+        self.last_step_deltas = self._step_deltas(i, x, y, w, h)
         self._pending_shape = None
         self._cursor += 1
+
+    def _step_deltas(self, i, x, y, w, h) -> Tuple[float, float]:
+        """Exact, causal (x,y,w,h)-caused increase in total b2b+p2b
+        wirelength and bbox area, at the moment block i is committed --
+        every b2b/p2b edge is resolved exactly once, at whichever endpoint
+        is placed second (the other's position is already known), so
+        summing this over every _commit() call plus one residual
+        correction reproduces evaluate_solution's totals exactly. See
+        rl/reward.py's _step_quality_delta, which consumes this."""
+        cx, cy = x + w / 2, y + h / 2
+        delta_wl = 0.0
+        for j, wt in self._b2b_adj.get(i, []):
+            pj = self.positions[j]
+            if pj is not None and j != i:
+                pcx, pcy = pj[0] + pj[2] / 2, pj[1] + pj[3] / 2
+                delta_wl += wt * (abs(cx - pcx) + abs(cy - pcy))
+        for pin_idx, wt in self._p2b_adj.get(i, []):
+            px, py = self.instance.pins_pos[pin_idx].tolist()
+            delta_wl += wt * (abs(cx - px) + abs(cy - py))
+        delta_area = self._grow_bbox(x, y, w, h)
+        return delta_wl, delta_area
 
     def _is_mib_leader(self, i):
         ncols = self.instance.constraints.shape[1]

@@ -183,3 +183,111 @@ def test_no_free_position_raises_clear_error():
     w, h = env.choose_aspect(4)  # square
     with pytest.raises(RuntimeError):
         env.position_mask(w, h)
+
+
+def test_wiremask_is_zero_with_no_placed_neighbors():
+    # First block in the order has no already-placed connected block/pin to
+    # pull toward -- the channel should be a flat zero, not garbage.
+    inst = synthetic_instance(area_targets=[4.0, 9.0], b2b_edges=[(0, 1, 1.0)])
+    env = GridPlacementEnv(inst, grid_dim=10)
+    w, h = env.choose_aspect(4)
+    wm = env.wiremask(w, h)
+    assert wm.shape == (10, 10)
+    assert torch.allclose(wm, torch.zeros(10, 10))
+
+
+def test_wiremask_prefers_side_closer_to_placed_neighbor():
+    # Block 1 is wired to block 0; once block 0 is placed on the left half
+    # of the canvas, the wiremask should rate left-half cells strictly
+    # higher (better) than right-half cells for block 1's placement.
+    inst = synthetic_instance(area_targets=[4.0, 4.0], b2b_edges=[(0, 1, 1.0)])
+    env = GridPlacementEnv(inst, grid_dim=10)
+    w0, h0 = env.choose_aspect(4)  # square
+    env.position_mask(w0, h0)
+    env.place(gy=0, gx=0)  # block 0 pinned to the low-x/low-y corner
+
+    w1, h1 = env.choose_aspect(4)
+    wm = env.wiremask(w1, h1)
+    left_half = wm[:, :5]
+    right_half = wm[:, 5:]
+    assert left_half.mean() > right_half.mean()
+
+
+def test_wiremask_includes_p2b_pins_regardless_of_placement_order():
+    # Pins are fixed geometry (not something placed during the rollout), so
+    # a block's own connected pins should contribute even on the very first
+    # step, unlike b2b neighbors.
+    inst = synthetic_instance(
+        area_targets=[4.0],
+        p2b_edges=[(0, 0, 1.0)],
+        pins_pos=[[9.0, 9.0]],
+    )
+    env = GridPlacementEnv(inst, grid_dim=10)
+    env.x_max, env.y_max = 10.0, 10.0
+    env.cell_w = env.cell_h = 1.0
+    w, h = env.choose_aspect(4)
+    wm = env.wiremask(w, h)
+    assert not torch.allclose(wm, torch.zeros_like(wm))
+    # cell nearest the pin (9, 9) should be rated better than the far corner.
+    assert wm[9, 9] > wm[0, 0]
+
+
+def test_step_deltas_zero_wirelength_for_first_placed_block():
+    # No already-placed neighbor exists yet, so nothing can resolve; the
+    # bbox always grows from nothing though.
+    inst = synthetic_instance(area_targets=[4.0, 4.0], b2b_edges=[(0, 1, 1.0)])
+    env = GridPlacementEnv(inst, grid_dim=10)
+    w0, h0 = env.choose_aspect(4)
+    env.position_mask(w0, h0)
+    env.place(gy=0, gx=0)
+    delta_wl, delta_area = env.last_step_deltas
+    assert delta_wl == pytest.approx(0.0)
+    assert delta_area > 0.0
+
+
+def test_step_deltas_match_manual_wirelength_and_area_for_second_block():
+    inst = synthetic_instance(area_targets=[4.0, 4.0], b2b_edges=[(0, 1, 2.0)])
+    env = GridPlacementEnv(inst, grid_dim=10)
+    env.x_max, env.y_max = 10.0, 10.0
+    env.cell_w = env.cell_h = 1.0
+
+    w0, h0 = env.choose_aspect(4)  # square, area 4 -> 2x2
+    env.position_mask(w0, h0)
+    env.place(gy=0, gx=0)  # block 0 at (0,0,2,2), center (1,1)
+
+    w1, h1 = env.choose_aspect(4)
+    env.position_mask(w1, h1)
+    env.place(gy=0, gx=4)  # block 1 at (4,0,2,2), center (5,1)
+
+    delta_wl, delta_area = env.last_step_deltas
+    expected_wl = 2.0 * (abs(5 - 1) + abs(1 - 1))  # weight * manhattan(centers)
+    assert delta_wl == pytest.approx(expected_wl)
+    # bbox grew from [0,2]x[0,2] (area 4) to [0,6]x[0,2] (area 12)
+    assert delta_area == pytest.approx(8.0)
+
+
+def test_step_deltas_sum_to_full_rollout_totals():
+    # The whole point of _step_deltas: summed over every commit in a full
+    # rollout, it must reproduce the exact same wirelength/area the contest
+    # evaluator computes from final positions -- see rl/reward.py's
+    # step_quality_delta docstring.
+    from iccad2026_evaluate import calculate_bbox_area, calculate_hpwl_b2b
+
+    inst = synthetic_instance(
+        area_targets=[4.0, 9.0, 6.0],
+        b2b_edges=[(0, 1, 1.0), (1, 2, 2.0)],
+    )
+    env = GridPlacementEnv(inst, grid_dim=16)
+    total_wl, total_area_delta = 0.0, 0.0
+    while not env.done():
+        w, h = env.choose_aspect(4)
+        mask, _, _ = env.position_mask(w, h)
+        gy, gx = mask.nonzero()[0].tolist()
+        env.place(gy=gy, gx=gx)
+        dwl, darea = env.last_step_deltas
+        total_wl += dwl
+        total_area_delta += darea
+
+    positions = env.finalize()
+    assert total_wl == pytest.approx(calculate_hpwl_b2b(positions, inst.b2b_connectivity))
+    assert total_area_delta == pytest.approx(calculate_bbox_area(positions))

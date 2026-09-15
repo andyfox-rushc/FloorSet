@@ -43,6 +43,22 @@ current layout. The generated map is then masked by a density-based
 legality check (occupancy below a 60% threshold, not exact geometric
 overlap) before sampling a placement.
 
+Deviating from the paper here: our `PositionCNN` (`rl/networks.py`)
+*convolves* over the actual occupancy/cluster grid rather than generating
+one from a compact vector, and adds a third spatial channel -- `wiremask`
+(`rl/env.py`) -- with no equivalent in the paper's design. Occupancy and
+cluster_grid say where placement is legal/clustered, not where it's cheap;
+without an explicit wirelength channel, the only path from "connectivity"
+to "good HPWL position" was through a spatially-uniform embedding vector
+broadcast identically to every grid cell, forcing the conv layers to
+recover spatial HPWL structure with no direct geometric hint. `wiremask`
+gives each candidate cell the weighted-Manhattan cost (the exact b2b/p2b
+formula the contest scores with) of placing the current block's center
+there against every already-placed connected block/pin, normalized
+per-step into an attraction map. This mirrors the "wiremask"/"position
+mask" fix later chip-placement RL papers (e.g. MaskPlace) made to this
+same gap in the original AlphaChip design.
+
 ## Reward
 
 Sparse -- zero every step except the last, where it's:
@@ -54,6 +70,121 @@ R = -Wirelength - 0.01 x Congestion
 (HPWL-based wirelength, a routing-congestion estimate from a smoothed
 demand map). Density is enforced as a hard constraint via the masking
 above, not as a reward term.
+
+Deviating from the paper here too: their terminal-only reward is standard
+for macro placement, where congestion genuinely can't be attributed to a
+specific earlier action. Ours doesn't have that excuse -- HPWL is a literal
+sum over independent b2b/p2b edges, each fully resolved (both its
+endpoints known) the instant the second one is placed, and bbox area only
+ever grows monotonically as blocks are added. That means the exact same
+terminal cost can be redistributed, with zero approximation, into a
+per-placement-step piece (`GridPlacementEnv._step_deltas` in `rl/env.py`,
+consumed by `rl/reward.py`'s `step_quality_delta`). Before this
+(2026-09-09), `rl/ppo.py`'s advantage used the identical whole-episode
+reward for every single transition -- with ~60-200 sequential decisions
+per episode and only a handful of episodes per training iteration, PPO had
+no way to tell which specific position choices caused the final
+wirelength/area versus which didn't, only whether the whole trajectory was
+better or worse than the value baseline predicted. This was diagnosed as
+the actual bottleneck behind a training plateau that survived a separate,
+also-real fix to the `wiremask` channel's normalization (see "Policy and
+value networks" above) -- the position head had a strong instantaneous
+HPWL signal available and still couldn't learn to use it, because nothing
+in training could differentially reward acting on it well versus poorly.
+`collect_episode` now gives each `Transition` a `return_to_go` (suffix sum
+of its own and every later step's exact piece, plus one residual
+correction on the final step for the `max(0, gap)` floor and any
+untracked auto-placed-cluster-touch cost), and the value head predicts
+that instead of a flat per-episode constant. No architecture or checkpoint
+change was needed -- the value head's inputs are unchanged; it's just
+fitting a target that now actually varies within an episode.
+
+**2026-09-12: the reward was scoring the wrong geometry.** The real
+submission (`rl/finetune.py`'s `finetune_and_solve`) always runs the raw
+RL rollout through `rl/compaction.py`'s deterministic gravity-compaction
+before returning it -- that's the only thing that ever closes the gap
+between the RL policy's naturally spread-out placement (see "Policy and
+value networks" -- `CANVAS_PADDING` gives it far more room than it needs)
+and a tightly packed one. But `rl/reward.py`'s `_evaluate` scored the raw,
+*pre*-compaction positions, so `area_gap` (and the HPWL contribution from
+that same spread-out geometry) got zero gradient signal for the entire
+project -- training could run indefinitely and the policy would never
+learn to pack tighter, because the thing it was being scored on didn't
+reflect what actually got submitted. Confirmed directly: `area_gap` had
+been flat at ~1.12-1.22 (i.e. ~2.1-2.2x baseline area) across every
+training run since the project started (see training-history memory).
+Fixed by compacting inside `_evaluate` before scoring, for both
+`pretraining_reward` and `inference_reward` -- now the training signal and
+the actual submission are scored on the same geometry. Verified this
+doesn't change any existing reward test (the hand-built test fixtures
+happen to already be fully compacted, so `compact()` is a no-op on them).
+
+**Also 2026-09-12, found while validating the above: compaction itself had
+a real bug that was making `boundary_violations` *worse*, not better.**
+`rl/compaction.py`'s right/top-pinned-edge handling used to move every
+block sharing an edge pin by the same shared amount (the least any single
+member could move alone), reasoning they "must stay flush." That's wrong
+-- they don't need to move together, only to each independently land on
+whatever the final bbox edge turns out to be, and forcing lockstep motion
+let one more-blocked member cap how far every other member could go,
+stranding it short of the edge. Verified directly on real validation
+cases: post-compaction `boundary_violations` were *higher* than
+pre-compaction on 13 of the first 15 cases checked (e.g. 5->8). Fixed:
+`_shift_group_x`/`_shift_group_y` now compute the tightest edge the group
+could jointly reach *and* the tightest edge non-group content already
+occupies (the term the old version was missing entirely), and pull every
+member to whichever is larger, independently. Once this no longer fights
+itself, compaction's area_gap improvement got much bigger on
+boundary-heavy cases too -- e.g. one validation case went from
+`area_gap` 1.199 (pre-fix) to 0.642 (post-fix) purely from compaction now
+being able to shrink every edge correctly.
+
+**Also 2026-09-12: `rl/ordering.py`'s placement order had no notion of
+boundary urgency.** A boundary pin (especially a corner -- two bits set)
+needs a specific cell (`env.py`'s `_boundary_mask`; a corner pin is the
+intersection of two edge masks, i.e. exactly one cell), so whichever block
+gets there first wins it and every later block needing the same pin falls
+back to an unconstrained placement (`GridPlacementEnv.boundary_fallback_count`)
+-- a real, permanent soft-constraint violation, since nothing later
+(including compaction) can retroactively grant it that cell. The order was
+purely descending-area / connectivity-driven, with no preference for
+placing these blocks while the canvas is emptiest. Fixed: unit ordering
+now seeds each unit's connectivity score with a boundary-priority bonus
+(corner > single edge > none -- see `_boundary_priority`), well below the
+same-cluster bonus (so cluster cohesion still wins when both apply) but
+enough to move boundary-critical units to the front whenever they'd
+otherwise have no connectivity pulling them there. Measured on the first
+15 validation cases: average `violations_relative` (boundary + grouping +
+MIB, the term `compute_cost` multiplies cost by `exp(BETA * v)` with
+`BETA=2.0`) dropped from ~0.34 to ~0.25, with zero regressions across the
+sample.
+
+All three fixes verified: 175/175 tests pass, and none of them touch
+`rl/ppo.py`'s exact-decomposition invariant (`return_to_go` still sums to
+whatever `reward` comes out to, whatever that now is).
+
+**2026-09-13/14: after ~6200 more training iterations under the three
+fixes above produced no further improvement (tracked in
+floorset-training-history memory), found a fourth gap -- this time in
+`rl/env.py`'s `_try_cluster_touch`, the likely dominant source of
+`grouping_violations`.** It only tried one candidate offset per neighbor
+per side (the neighbor's own coordinate) before falling through to
+`position_mask()`'s `_adjacency_mask`, a grid-dilation fallback that uses
+a full 3x3 (diagonal-inclusive) kernel -- meaning it can select a cell
+that's merely grid-adjacent, even corner-only touching, to the cluster.
+`position_mask()` treats that as legal, but `evaluate_solution`'s real
+shapely-based connected-components check does not count it as touching.
+This matches the data: `grouping_violations` were consistently several
+times higher than `grouping_fallback_count` across every diagnostic run,
+meaning most disconnections were happening through this "successful" but
+imprecise path, not through outright fallback. Fixed by making
+`_try_cluster_touch` search every grid-aligned offset along the whole
+legal touching range for each neighbor/side (a new `_grid_values`
+helper), not just one -- same per-candidate `_rect_overlap` safety check
+as before, so this can only find more real touches, never introduce an
+overlap. Not yet measured whether this moves `grouping_violations` in
+practice; that's the next thing to check once training has run under it
+for a while.
 
 ## The key trick: why it generalizes to new chips
 
@@ -231,6 +362,18 @@ gradient-clipping note in `rl/ppo.py`). To roll back:
 cp checkpoints/history/policy_iter009000.pt checkpoints/policy.pt
 ```
 
+Any history snapshot from before the `wiremask` channel was added (2026-09-08,
+`position_cnn.conv1` in_channels 18 -> 19) needs migrating first or it won't
+load -- run it through `scripts/migrate_checkpoint_wiremask.py`, which
+expands conv1's weight tensor and zero-inits the new channel (so the
+migrated checkpoint's behavior is unchanged until further training adapts
+it):
+
+```bash
+python scripts/migrate_checkpoint_wiremask.py \
+  checkpoints/history/policy_iter009000.pt checkpoints/policy.pt
+```
+
 For a long run, launch it detached so it survives the terminal closing, and
 tee the log somewhere persistent:
 
@@ -323,6 +466,7 @@ iccad2026contest/
 | `ppo.py` | Episode rollout collection and the PPO clipped-surrogate update, including temperature-annealed/greedy sampling and gradient clipping |
 | `pretrain.py` | Staged encoder warm-start: supervised regression to predict realized episode reward, then the prediction head is discarded and only the trained encoder is kept (mirrors the actual paper's mechanism -- see above) |
 | `finetune.py` | Per-instance PPO fine-tuning used inside `my_optimizer.py`'s `solve()`, since the hidden test set exposes no ground-truth baseline to pretrain against |
+| `anneal.py` | Post-RL simulated-annealing polish (`anneal_polish`), run in `my_optimizer.py`'s `solve()` after `finetune_and_solve` returns -- locally perturbs (translate/swap/rotate) the already-feasible, already-compacted layout and keeps whatever lowers `inference_reward`'s baseline-free cost, since the RL policy places each block once, in order, and never revisits an earlier choice in light of later ones |
 | `train.py` | The offline pretraining CLI documented above |
 
 ### `tests/`
@@ -355,4 +499,76 @@ was), left in place rather than deleted -- they're the record of what
 happened, including the run that destabilized and the diagnosis that led
 to the gradient-clipping fix. Watch for a climbing `avg_reward=-10.0000`
 rate or rising `grad_norm` values as an early warning sign in any of these.
+
+## Feature set and reward function -- a 2026-09-14 review
+
+A ground-up review of exactly what's encoded and what's optimized, checked
+directly against the current code (not just this doc) since the two had
+drifted in one place -- see the correction at the end.
+
+**Three tiers of input, computed at different frequencies:**
+
+1. **Static netlist features, GNN-encoded once per instance**
+   (`rl/encoder.py`). Per-block, 9-dim (`BLOCK_FEAT_DIM`):
+   `[log_area, is_fixed, is_preplaced, has_mib, has_cluster, boundary_left,
+   boundary_right, boundary_top, boundary_bottom]` -- purely the block's
+   *constraint identity*, not its geometry or placement status. Per-pin,
+   2-dim normalized `(x, y)`. These feed the hand-rolled edge-weighted GNN
+   (message-passed for `num_gnn_layers=3` rounds, mean-aggregated,
+   residual) into a per-block embedding (`hidden_dim=64`) plus a global
+   embedding = mean over block embeddings. This encoder runs exactly once
+   per episode -- it has no notion of which blocks are already placed or
+   where; that's carried entirely by tiers 2 and 3.
+
+2. **Per-step spatial channels feeding `PositionCNN`** (`rl/env.py`,
+   48x48 grid by default): `occupancy` (binary, cells taken), `cluster_grid`
+   (binary, current block's cluster group), and `wiremask` (the only
+   channel carrying an actual wirelength signal -- see "Policy and value
+   networks" above). The current block's embedding + global embedding +
+   progress are projected and broadcast as a spatially-uniform extra
+   channel, concatenated with the three spatial channels, then 2 conv
+   layers + a 1x1 output conv produce the position logit map.
+
+3. **Scalar context fed to every head**: `progress` = fraction of blocks
+   placed so far (`env._cursor / total_steps`) -- the only explicit "how
+   far along are we" signal. Aspect-ratio choice is a separate small head
+   (`AspectHead`) over 9 fixed log-spaced buckets (`[0.2, 0.3, 0.45, 0.67,
+   1.0, 1.5, 2.22, 3.33, 5.0]`), chosen before position for blocks that
+   need one (MIB followers copy their leader's shape instead).
+
+**Reward** (`rl/reward.py`): two modes, both built on the real
+`evaluate_solution` so training reward and actual scoring always agree on
+violation accounting.
+
+- `pretraining_reward` (ground truth available: training/validation) =
+  `-quality_factor * violation_factor`, uncapped -- `quality_factor = 1 +
+  ALPHA * (max(0,hpwl_gap) + max(0,area_gap))` against the ground-truth
+  baseline, `violation_factor = exp(BETA * violations_relative)`,
+  `BETA=2.0`.
+- `inference_reward` (contest time, no ground truth -- also what the new
+  SA polish pass optimizes, see below) = same violation accounting, but
+  quality is *absolute* `hpwl_total + 0.01*bbox_area` instead of a gap
+  against an unknown baseline; flat `-M_PENALTY` if infeasible.
+
+Both score `compact(positions)`, not the raw rollout (the 2026-09-12 fix
+described above). Credit assignment is exact, not approximated: HPWL
+resolves edge-by-edge and bbox area only grows monotonically, so
+`_step_deltas`/`step_quality_delta` attribute the exact per-step
+contribution to whichever step caused it, and PPO's advantage uses
+`return_to_go` (suffix sum) instead of the flat episode reward -- the
+single biggest fix in the project's history (see "Reward" above).
+
+**Correction to this doc:** "Policy and value networks" above describes
+the value/policy input as "graph embedding, current macro's embedding, and
+a small metadata vector (routing capacity, net/macro/cluster counts,
+canvas size)" -- that's the *paper's* design, not what's implemented here.
+In this codebase, `ScalarHead`/`AspectHead` only ever see
+`[block_embedding, global_embedding, progress]` or `[global_embedding,
+progress]` -- no separate routing-capacity/count/canvas-size vector exists
+in the code. Also, the global embedding is the mean over *block*
+embeddings (`ActorCritic.encode`), not "the mean over edge
+representations" as the state-representation section says. Neither is a
+functional bug -- the network trains and the tests pass either way -- but
+anyone touching `rl/networks.py` or `rl/encoder.py` should trust the code
+over that older prose.
 

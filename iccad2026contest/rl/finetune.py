@@ -33,6 +33,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from .compaction import compact
 from .env import ASPECT_RATIOS, GridPlacementEnv
 from .networks import ActorCritic
 from .ppo import collect_batch, collect_episode, ppo_update
@@ -59,7 +60,7 @@ def greedy_fallback_positions(instance, grid_dim: int) -> List[Tuple[float, floa
         valid = mask.nonzero(as_tuple=False)
         gy, gx = int(valid[0, 0]), int(valid[0, 1])
         env.place(gy, gx)
-    return env.finalize()
+    return compact(env.finalize(), instance.constraints)
 
 
 def finetune_and_solve(
@@ -91,7 +92,10 @@ def finetune_and_solve(
         # by the last budgeted iteration (see module docstring).
         temperature = 1.0 - (1.0 - MIN_FINETUNE_TEMPERATURE) * (iteration / max(max_iterations - 1, 1))
         episodes = collect_batch(net, instance, grid_dim=grid_dim, use_baseline=False,
-                                  num_episodes=episodes_per_iter, temperature=temperature)
+                                  num_episodes=episodes_per_iter, temperature=temperature,
+                                  deadline=start + time_budget)
+        if not episodes:
+            break  # budget ran out before a single episode finished this iteration
         for ep in episodes:
             if ep.positions is not None and ep.reward > best_reward:
                 best_reward = ep.reward
@@ -120,5 +124,10 @@ def finetune_and_solve(
         if verbose:
             print("  every PPO rollout failed; using greedy fallback placement")
         best_positions = greedy_fallback_positions(instance, grid_dim)
+    else:
+        # Deterministic post-process only -- never fed back into PPO's
+        # reward (see rl/compaction.py), so this cannot affect what the
+        # policy learns, only what's actually returned as the answer.
+        best_positions = compact(best_positions, instance.constraints)
 
     return best_positions, net

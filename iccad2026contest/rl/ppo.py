@@ -2,19 +2,31 @@
 PPO rollout collection + clipped-surrogate update for the sequential
 placement policy.
 
-Reward is sparse and terminal (one value per full episode, from rl/reward.py
--- exact contest cost when a baseline is available, the no-baseline proxy
-otherwise), so every step in an episode shares the same return; the value
-head's job is purely a per-step baseline (conditioned on the static graph
-embedding + how far through placement we are) for variance reduction, not a
-discounted multi-reward return.
+The terminal reward (rl/reward.py -- exact contest cost when a baseline is
+available, the no-baseline proxy otherwise) is exactly decomposable into a
+per-placement-step piece, since HPWL is a sum over independent edges each
+resolved the moment their second endpoint is placed, and bbox area only
+ever grows monotonically as blocks are added (see
+GridPlacementEnv._step_deltas / rl/reward.py's step_quality_delta). Each
+Transition's `return_to_go` is the sum of its own and every later step's
+piece, so PPO's advantage differentiates between the specific actions that
+actually caused wirelength/area, instead of every action in an episode
+sharing one identical whole-episode advantage (the previous design, which
+made it impossible to reinforce good position choices over bad ones within
+a single ~100-step rollout). The value head predicts this per-step
+return-to-go, conditioned on the static graph embedding + progress --
+still not a discounted multi-reward return (no per-step discounting; γ=1
+throughout, matching the exact, un-discounted decomposition), just a
+target that now actually varies within an episode instead of being
+constant.
 
-The reward-approximation head (for AlphaChip fidelity) is trained alongside
-the policy via supervised regression against that same realized episode
-reward -- it does not itself drive the policy gradient; the exact reward
-already does that directly, since it's cheap to compute here.
+The reward-approximation head (for AlphaChip fidelity) is unaffected by
+this -- it still regresses the whole-episode realized reward (`ep.reward`),
+matching its documented purpose of predicting the final realized outcome
+from any state; it does not itself drive the policy gradient.
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -26,7 +38,7 @@ from iccad2026_evaluate import M_PENALTY
 from .encoder import build_block_features, build_pin_features
 from .env import GridPlacementEnv
 from .networks import ActorCritic, masked_log_softmax
-from .reward import inference_reward, pretraining_reward
+from .reward import inference_reward, pretraining_reward, step_quality_delta
 
 
 MIN_TEMPERATURE = 1e-3
@@ -51,7 +63,10 @@ class Transition:
     temperature: float = 1.0
     occupancy: Optional[torch.Tensor] = None
     cluster_grid: Optional[torch.Tensor] = None
+    wiremask: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
+    step_reward: float = 0.0    # this step's own causal piece (0 for 'aspect' steps)
+    return_to_go: float = 0.0   # filled in after the episode ends; see collect_episode
 
 
 @dataclass
@@ -114,6 +129,7 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
             if cid and env.cluster_cells.get(cid):
                 for (gy, gx) in env.cluster_cells[cid]:
                     cluster_grid[gy, gx] = 1.0
+            wiremask = env.wiremask(w, h)
 
             # A block whose chosen (extreme aspect ratio) shape no longer
             # fits anywhere is a real possibility with a stochastic,
@@ -127,19 +143,23 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
             mask, _, _ = result
             out_h, out_w = mask.shape
             with torch.no_grad():
-                full_logits = net.position_logits(occupancy_before, cluster_grid, block_emb, global_emb,
-                                                   step.block_idx, progress_t)
+                full_logits = net.position_logits(occupancy_before, cluster_grid, wiremask, block_emb,
+                                                   global_emb, step.block_idx, progress_t)
                 cropped = _temp_scale(full_logits[:out_h, :out_w], temperature)
                 log_probs = masked_log_softmax(cropped, mask).reshape(-1)
                 flat_action = (int(torch.argmax(log_probs).item()) if greedy
                                else torch.multinomial(log_probs.exp(), 1).item())
 
             gy, gx = divmod(flat_action, out_w)
-            transitions.append(Transition('position', step.block_idx, progress, flat_action,
-                                           log_probs[flat_action].item(), temperature=temperature,
-                                           occupancy=occupancy_before, cluster_grid=cluster_grid,
-                                           mask=mask))
+            tr = Transition('position', step.block_idx, progress, flat_action,
+                             log_probs[flat_action].item(), temperature=temperature,
+                             occupancy=occupancy_before, cluster_grid=cluster_grid,
+                             wiremask=wiremask, mask=mask)
+            transitions.append(tr)
             env.place(gy, gx)
+            delta_wl, delta_area = env.last_step_deltas
+            tr.step_reward = step_quality_delta(delta_wl, delta_area, use_baseline,
+                                                 instance.baseline_metrics)
 
         positions = env.finalize()
     except RuntimeError:
@@ -150,14 +170,39 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
     else:
         reward = (pretraining_reward(instance, positions) if use_baseline
                   else inference_reward(instance, positions))
+
+    # One residual correction, added to the final transition, makes the
+    # per-step decomposition land on `reward` exactly -- it absorbs the
+    # max(0, gap) floor (step_quality_delta never clips) and any cost from
+    # auto-placed cluster-touch blocks (which commit a position with no
+    # matching Transition to attribute it to). See rl/reward.py's
+    # step_quality_delta docstring.
+    if transitions:
+        tracked = sum(tr.step_reward for tr in transitions)
+        transitions[-1].step_reward += reward - tracked
+        running = 0.0
+        for tr in reversed(transitions):
+            running += tr.step_reward
+            tr.return_to_go = running
+
     return Episode(transitions, reward, positions, block_feats, pin_feats,
                     instance.b2b_connectivity, instance.p2b_connectivity)
 
 
 def collect_batch(net: ActorCritic, instance, grid_dim: int, use_baseline: bool,
-                   num_episodes: int, temperature: float = 1.0) -> List[Episode]:
-    return [collect_episode(net, instance, grid_dim, use_baseline, temperature=temperature)
-            for _ in range(num_episodes)]
+                   num_episodes: int, temperature: float = 1.0,
+                   deadline: Optional[float] = None) -> List[Episode]:
+    """`deadline` (an absolute time.time() value), if given, stops starting
+    new episodes once passed -- so a slow per-episode rollout can't blow the
+    caller's time budget by a full batch's worth of episodes (see
+    finetune.py, which was previously only checking its budget between full
+    iterations, letting a single iteration overshoot by 6+ episodes)."""
+    episodes = []
+    for _ in range(num_episodes):
+        if deadline is not None and time.time() >= deadline:
+            break
+        episodes.append(collect_episode(net, instance, grid_dim, use_baseline, temperature=temperature))
+    return episodes
 
 
 def ppo_update(
@@ -186,9 +231,10 @@ def ppo_update(
 
             for tr in ep.transitions:
                 progress_t = torch.tensor(tr.progress, dtype=torch.float32)
+                return_t = torch.tensor(tr.return_to_go, dtype=torch.float32)
                 value = net.value(global_emb, progress_t)
                 reward_pred = net.reward_approx(global_emb, progress_t)
-                advantage = (reward_t - value).detach()
+                advantage = (return_t - value).detach()
 
                 if tr.kind == 'aspect':
                     logits = net.aspect_logits(block_emb, global_emb, tr.block_idx, progress_t)
@@ -197,8 +243,8 @@ def ppo_update(
                     probs = log_probs.exp()
                     entropy = -(probs * log_probs).sum()
                 else:
-                    full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, block_emb,
-                                                        global_emb, tr.block_idx, progress_t)
+                    full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, tr.wiremask,
+                                                        block_emb, global_emb, tr.block_idx, progress_t)
                     out_h, out_w = tr.mask.shape
                     cropped = _temp_scale(full_logits[:out_h, :out_w], tr.temperature)
                     log_probs = masked_log_softmax(cropped, tr.mask).reshape(-1)
@@ -211,7 +257,7 @@ def ppo_update(
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantage
                 policy_loss_sum = policy_loss_sum - torch.min(surr1, surr2)
-                value_loss_sum = value_loss_sum + (value - reward_t) ** 2
+                value_loss_sum = value_loss_sum + (value - return_t) ** 2
                 reward_loss_sum = reward_loss_sum + (reward_pred - reward_t) ** 2
                 entropy_sum = entropy_sum + entropy
                 count += 1

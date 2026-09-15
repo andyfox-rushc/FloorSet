@@ -24,7 +24,9 @@ Usage:
 """
 
 import argparse
+import gc
 import os
+import resource
 import sys
 import time
 from pathlib import Path
@@ -54,7 +56,10 @@ def iter_training_instances(data_path: str = "../"):
 
     if is_dataset_downloaded(data_path):
         from iccad2026_evaluate import get_training_dataloader
-        loader = get_training_dataloader(data_path=data_path, batch_size=1, shuffle=True)
+        # shuffle=False: FloorplanDatasetLite caches one file at a time;
+        # shuffled indices rarely reuse a file across the 24GB corpus, which
+        # doesn't fit this machine's 15GB RAM, thrashing the page cache.
+        loader = get_training_dataloader(data_path=data_path, batch_size=1, shuffle=False)
         while True:
             for batch in loader:
                 area_target, b2b_conn, p2b_conn, pins_pos, constraints, _, fp_sol, metrics = batch
@@ -129,9 +134,19 @@ def main():
                                   num_episodes=args.episodes_per_iter)
         stats = ppo_update(net, optimizer, episodes, epochs=args.ppo_epochs)
         avg_reward = sum(e.reward for e in episodes) / len(episodes)
-        print(f"iter {it}/{args.iterations} blocks={inst.block_count} "
-              f"avg_reward={avg_reward:.4f} loss={stats['loss']:.4f} "
-              f"grad_norm={stats['grad_norm']:.4f} elapsed={time.time() - t0:.1f}s")
+        del episodes  # drop references before the next iteration's allocations
+
+        rss_mb = None
+        if it % 50 == 0:
+            gc.collect()
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+        line = (f"iter {it}/{args.iterations} blocks={inst.block_count} "
+                f"avg_reward={avg_reward:.4f} loss={stats['loss']:.4f} "
+                f"grad_norm={stats['grad_norm']:.4f} elapsed={time.time() - t0:.1f}s")
+        if rss_mb is not None:
+            line += f" rss_mb={rss_mb:.1f}"
+        print(line)
 
         if it % args.checkpoint_every == 0 or it == args.iterations:
             torch.save(net.state_dict(), args.checkpoint)

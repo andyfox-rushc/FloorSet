@@ -23,9 +23,20 @@ Reinforcement Learning", section on macro ordering):
        from the largest unit; at each step, prefer whichever remaining unit
        has the strongest accumulated b2b connectivity to everything already
        placed (a virtual "same cluster" edge counts as very strong
-       connectivity, so cluster members still end up adjacent); when no
-       remaining unit is connected to the placed set at all, fall back to
-       the largest remaining unit (starts a new connected component). This
+       connectivity, so cluster members still end up adjacent), seeded with
+       a boundary-pin bonus (corner pins > single-edge pins > none, see
+       _boundary_priority) so a boundary-critical unit jumps the queue even
+       with no connectivity yet -- env.py's boundary mask requires a
+       specific cell (a single cell for a corner pin, since it's the
+       intersection of two edge masks), so whichever block gets there
+       first wins it; placing these while the canvas is emptiest cuts down
+       how often a later same-pin block finds its cell already taken and
+       has to fall back to an unconstrained placement (see
+       GridPlacementEnv.boundary_fallback_count, and evaluate_solution's
+       resulting boundary_violations -- diagnosed 2026-09-12 as the
+       dominant source of the contest's soft-violation penalty). When no
+       remaining unit has either kind of priority, fall back to the
+       largest remaining unit (starts a new connected component). This
        both mimics the paper's ordering and gives the env's cluster-touch
        logic more same-cluster neighbors to actually touch against.
 """
@@ -40,6 +51,31 @@ import torch
 # preferred over merely-connected ones, without needing a separate grouping
 # pass -- see _order_units_by_connectivity.
 _CLUSTER_BONUS = 1e6
+
+# Dominates any real b2b edge weight (so a boundary-critical unit still
+# jumps the queue even with zero connectivity to what's placed so far) but
+# stays 1000x below _CLUSTER_BONUS (so cluster cohesion still wins whenever
+# both apply) -- see _boundary_priority and its use in
+# _order_units_by_connectivity.
+_BOUNDARY_BONUS = 1e3
+
+
+def _boundary_priority(unit: List[int], boundary_id: torch.Tensor) -> int:
+    """0 (no boundary pin), 1 (single-edge pin), or 2 (corner pin -- two
+    bits set) -- the largest across the unit's members. Corner pins need
+    the single specific grid cell where their two required edges meet
+    (env.py's _boundary_mask intersects both edge masks), so they're the
+    most likely to lose a same-cell race if something else is placed
+    first; single-edge pins have a whole edge/row of cells to share and
+    conflict far less often (see rl/compaction.py's diagnosis of
+    boundary_fallback_count -- placing these last was the dominant cause
+    of the soft boundary violations that showed up in evaluate_solution)."""
+    best = 0
+    for m in unit:
+        code = int(boundary_id[m])
+        if code:
+            best = max(best, 2 if bin(code).count('1') >= 2 else 1)
+    return best
 
 
 @dataclass
@@ -64,6 +100,7 @@ def _order_units_by_connectivity(
     area_targets: torch.Tensor,
     cluster_id: torch.Tensor,
     b2b_connectivity: Optional[torch.Tensor],
+    boundary_id: torch.Tensor,
 ) -> List[List[int]]:
     """Greedy max-connectivity walk over units (see module docstring)."""
     n_units = len(units)
@@ -100,7 +137,16 @@ def _order_units_by_connectivity(
                 unit_adj[key] += _CLUSTER_BONUS
 
     remaining = set(range(n_units))
-    frontier_score: Dict[int, float] = {}
+    # Seeded (not accumulated) with each unit's own boundary priority, so a
+    # boundary-critical unit is already a "candidate" (frontier_score > 0)
+    # from the very first pick, instead of only becoming one once
+    # something already-placed happens to connect to it -- see
+    # _boundary_priority and the module docstring.
+    frontier_score: Dict[int, float] = {
+        u_idx: _boundary_priority(units[u_idx], boundary_id) * _BOUNDARY_BONUS
+        for u_idx in range(n_units)
+    }
+    frontier_score = {u: s for u, s in frontier_score.items() if s > 0.0}
     order_idxs: List[int] = []
 
     while remaining:
@@ -181,7 +227,8 @@ def compute_order(
     # Step 2: order units by greedy connectivity (falls back to plain
     # descending-area when there's no b2b/cluster signal at all -- see
     # _order_units_by_connectivity).
-    ordered_units = _order_units_by_connectivity(units, area_targets, cluster_id, b2b_connectivity)
+    ordered_units = _order_units_by_connectivity(units, area_targets, cluster_id,
+                                                  b2b_connectivity, boundary)
 
     for unit in ordered_units:
         leader = unit[0]

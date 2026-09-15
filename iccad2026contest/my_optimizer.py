@@ -54,6 +54,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from iccad2026_evaluate import FloorplanOptimizer
+from rl.anneal import anneal_polish
 from rl.data import from_solve_args
 from rl.finetune import finetune_and_solve
 from rl.networks import ActorCritic
@@ -74,6 +75,7 @@ class MyOptimizer(FloorplanOptimizer):
         max_iterations: int = 150,
         episodes_per_iter: int = 6,
         ppo_epochs: int = 3,
+        anneal_time_budget: float = 8.0,
         checkpoint_path: Optional[str] = None,
     ):
         super().__init__(verbose)
@@ -81,6 +83,7 @@ class MyOptimizer(FloorplanOptimizer):
         self.max_iterations = max_iterations
         self.episodes_per_iter = episodes_per_iter
         self.ppo_epochs = ppo_epochs
+        self.anneal_time_budget = anneal_time_budget
         self.checkpoint_path = checkpoint_path or DEFAULT_CHECKPOINT
 
     def _load_checkpoint(self) -> Optional[ActorCritic]:
@@ -116,4 +119,10 @@ class MyOptimizer(FloorplanOptimizer):
             ppo_epochs=self.ppo_epochs,
             verbose=self.verbose,
         )
+        if self.anneal_time_budget > 0:
+            positions = anneal_polish(
+                instance, positions,
+                time_budget=self.anneal_time_budget,
+                verbose=self.verbose,
+            )
         return positions

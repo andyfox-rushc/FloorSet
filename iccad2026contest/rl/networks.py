@@ -45,18 +45,25 @@ class AspectHead(nn.Module):
 
 
 class PositionCNN(nn.Module):
+    """Takes occupancy + cluster_grid + wiremask as spatial channels. Of
+    these, wiremask is the only one carrying an actual wirelength signal --
+    occupancy/cluster_grid say where placement is legal/clustered, not where
+    it's cheap; without it the policy has to infer HPWL-good positions
+    purely from the (spatially-uniform) block embedding broadcast below,
+    with no explicit geometric hint. See rl/env.py's wiremask() docstring."""
+
     def __init__(self, hidden_dim: int, cnn_channels: int = 16, conv_width: int = 32):
         super().__init__()
         self.embed_proj = nn.Linear(hidden_dim * 2 + 1, cnn_channels)
-        self.conv1 = nn.Conv2d(2 + cnn_channels, conv_width, 3, padding=1)
+        self.conv1 = nn.Conv2d(3 + cnn_channels, conv_width, 3, padding=1)
         self.conv2 = nn.Conv2d(conv_width, conv_width, 3, padding=1)
         self.conv3 = nn.Conv2d(conv_width, 1, 1)
 
-    def forward(self, occupancy, cluster_grid, block_embedding, global_embedding, progress):
+    def forward(self, occupancy, cluster_grid, wiremask, block_embedding, global_embedding, progress):
         g = occupancy.shape[0]
         ctx = torch.cat([block_embedding, global_embedding, progress.view(1)], dim=0)
         emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
-        x = torch.stack([occupancy, cluster_grid], dim=0)
+        x = torch.stack([occupancy, cluster_grid, wiremask], dim=0)
         x = torch.cat([x, emb_map], dim=0).unsqueeze(0)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
@@ -99,9 +106,9 @@ class ActorCritic(nn.Module):
     def aspect_logits(self, block_embeddings, global_embedding, block_idx, progress):
         return self.aspect_head(block_embeddings[block_idx], global_embedding, progress)
 
-    def position_logits(self, occupancy, cluster_grid, block_embeddings, global_embedding,
+    def position_logits(self, occupancy, cluster_grid, wiremask, block_embeddings, global_embedding,
                          block_idx, progress):
-        return self.position_cnn(occupancy, cluster_grid, block_embeddings[block_idx],
+        return self.position_cnn(occupancy, cluster_grid, wiremask, block_embeddings[block_idx],
                                   global_embedding, progress)
 
     def value(self, global_embedding, progress):

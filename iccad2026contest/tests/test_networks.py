@@ -31,7 +31,8 @@ def test_position_logits_shape_matches_grid():
     env = GridPlacementEnv(inst, grid_dim=12)
     occupancy = env.occupancy
     cluster_grid = torch.zeros_like(occupancy)
-    logits = net.position_logits(occupancy, cluster_grid, block_emb, global_emb,
+    wiremask = env.wiremask(1.0, 1.0)
+    logits = net.position_logits(occupancy, cluster_grid, wiremask, block_emb, global_emb,
                                   block_idx=0, progress=torch.tensor(0.0))
     assert logits.shape == (12, 12)
     assert torch.isfinite(logits).all()
@@ -63,7 +64,8 @@ def test_gradient_flows_end_to_end_through_position_head():
 
     env = GridPlacementEnv(inst, grid_dim=8)
     cluster_grid = torch.zeros_like(env.occupancy)
-    logits = net.position_logits(env.occupancy, cluster_grid, block_emb, global_emb,
+    wiremask = env.wiremask(1.0, 1.0)
+    logits = net.position_logits(env.occupancy, cluster_grid, wiremask, block_emb, global_emb,
                                   block_idx=0, progress=torch.tensor(0.5))
     mask = torch.ones_like(logits, dtype=torch.bool)
     log_probs = masked_log_softmax(logits, mask)

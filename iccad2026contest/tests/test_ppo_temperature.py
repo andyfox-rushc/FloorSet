@@ -92,8 +92,8 @@ def test_ppo_ratio_is_identity_before_any_update():
             log_probs = F.log_softmax(_temp_scale(logits, tr.temperature), dim=0)
             new_log_prob = log_probs[tr.action].item()
         else:
-            full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, block_emb,
-                                               global_emb, tr.block_idx, progress_t)
+            full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, tr.wiremask,
+                                               block_emb, global_emb, tr.block_idx, progress_t)
             out_h, out_w = tr.mask.shape
             cropped = _temp_scale(full_logits[:out_h, :out_w], tr.temperature)
             log_probs = masked_log_softmax(cropped, tr.mask).reshape(-1)
