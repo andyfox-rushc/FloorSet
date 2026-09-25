@@ -19,10 +19,21 @@ policy zero gradient signal toward the one thing (packing tightly)
 compaction can't do for it. See rl/reward.py's _evaluate docstring.
 
 Safety argument (why this can never introduce an overlap):
-    - Preplaced blocks and blocks in a nonzero cluster group (grouping
-      constraint requires them to stay mutually touching, which a
-      per-block independent shift could break) are marked immovable and
-      only ever act as static blockers.
+    - Preplaced blocks are marked immovable and only ever act as static
+      blockers.
+    - A nonzero cluster group (grouping constraint requires its members to
+      stay mutually touching) is never shifted per-block -- that could
+      break the touching arrangement -- but the whole group CAN slide as
+      one rigid unit (see _shift_cluster_x/_shift_cluster_y below), since a
+      pure translation preserves every member's relative position exactly.
+      Before this fix, cluster members were marked immovable and only ever
+      acted as static blockers, same as preplaced blocks -- correct for
+      safety but far too conservative: a cluster placed anywhere in
+      rl/env.py's padded working canvas, with nothing between it and the
+      rest of the layout, could never move an inch closer, no matter how
+      much slack surrounded it (see algorithm.md's compaction diagnosis on
+      test-98 -- this was verified to strand whole clusters 60-100+ units
+      from where they could safely sit).
     - An ordinary movable block's new coordinate is always
       min(current, max(floor, tightest real blocker)) -- i.e. it only ever
       moves toward the floor and only as far as the current (possibly
@@ -81,14 +92,16 @@ Position = Tuple[float, float, float, float]
 _EPS = 1e-9
 
 
-def _bound_x(pos: List[List[float]], i: int) -> float:
+def _bound_x(pos: List[List[float]], i: int, exclude: frozenset = frozenset()) -> float:
     """Tightest x a block could slide left to, i.e. the rightmost edge among
     blocks currently at-or-left of it with overlapping y-range (0.0 if
-    nothing blocks it)."""
+    nothing blocks it). `exclude` skips a set of indices entirely -- used to
+    ignore a block's own cluster-mates, which move with it and so can never
+    legitimately block it (see _shift_cluster_x)."""
     xi, yi, wi, hi = pos[i]
     bound = 0.0
     for j in range(len(pos)):
-        if j == i:
+        if j == i or j in exclude:
             continue
         xj, yj, wj, hj = pos[j]
         if xj > xi + _EPS:
@@ -99,12 +112,12 @@ def _bound_x(pos: List[List[float]], i: int) -> float:
     return bound
 
 
-def _bound_y(pos: List[List[float]], i: int) -> float:
+def _bound_y(pos: List[List[float]], i: int, exclude: frozenset = frozenset()) -> float:
     """Mirror of _bound_x for the y axis."""
     xi, yi, wi, hi = pos[i]
     bound = 0.0
     for j in range(len(pos)):
-        if j == i:
+        if j == i or j in exclude:
             continue
         xj, yj, wj, hj = pos[j]
         if yj > yi + _EPS:
@@ -113,6 +126,37 @@ def _bound_y(pos: List[List[float]], i: int) -> float:
             continue
         bound = max(bound, yj + hj)
     return bound
+
+
+def _shift_cluster_x(pos: List[List[float]], group: List[int], floor: float) -> None:
+    """Slide an entire cluster group left as one rigid unit, by the largest
+    amount safe for every member simultaneously -- the min over each
+    member's own individually-allowed slide (ignoring other group members
+    as blockers, since they move with it). This is the opposite pattern
+    from _shift_group_x's shared-edge pull: a cluster's members must keep
+    their exact relative arrangement (that's what "mutually touching"
+    means), so only a uniform translation is safe -- capping every member
+    to whichever one has the least room preserves that, and can never
+    overlap anything since each member's new x is never less than its own
+    (non-group) bound."""
+    if not group:
+        return
+    group_set = frozenset(group)
+    slide = min(pos[i][0] - max(_bound_x(pos, i, group_set), floor) for i in group)
+    if slide > _EPS:
+        for i in group:
+            pos[i][0] -= slide
+
+
+def _shift_cluster_y(pos: List[List[float]], group: List[int], floor: float) -> None:
+    """Mirror of _shift_cluster_x for the y axis."""
+    if not group:
+        return
+    group_set = frozenset(group)
+    slide = min(pos[i][1] - max(_bound_y(pos, i, group_set), floor) for i in group)
+    if slide > _EPS:
+        for i in group:
+            pos[i][1] -= slide
 
 
 def _sweep_x(pos: List[List[float]], immovable: List[bool], floor: float) -> None:
@@ -215,10 +259,19 @@ def compact(
     immovable_y = [False] * n
     right_group: List[int] = []
     top_group: List[int] = []
+    cluster_groups: dict = {}
     for i in range(n):
-        if preplaced[i] or cluster_id[i]:
+        if preplaced[i]:
             immovable_x[i] = True
             immovable_y[i] = True
+            continue
+        if cluster_id[i]:
+            # Immovable individually (the per-block sweep must never shift
+            # one member without the rest) but the whole group still slides
+            # together -- see _shift_cluster_x/_shift_cluster_y below.
+            immovable_x[i] = True
+            immovable_y[i] = True
+            cluster_groups.setdefault(int(cluster_id[i]), []).append(i)
             continue
         code = int(boundary[i])
         if code & 0b0011:  # left(1) or right(2)
@@ -233,9 +286,14 @@ def compact(
     pos = [list(p) for p in positions]
     floor_x = min(p[0] for p in pos)
     floor_y = min(p[1] for p in pos)
+    groups = list(cluster_groups.values())
     for _ in range(passes):
+        for group in groups:
+            _shift_cluster_x(pos, group, floor_x)
         _sweep_x(pos, immovable_x, floor_x)
         _shift_group_x(pos, right_group, floor_x)
+        for group in groups:
+            _shift_cluster_y(pos, group, floor_y)
         _sweep_y(pos, immovable_y, floor_y)
         _shift_group_y(pos, top_group, floor_y)
 

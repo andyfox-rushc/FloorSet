@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .compaction import compact
-from .env import ASPECT_RATIOS, GridPlacementEnv
+from .env import ASPECT_RATIOS, CANVAS_PADDING, GridPlacementEnv
 from .networks import ActorCritic
 from .ppo import collect_batch, collect_episode, ppo_update
 
@@ -45,22 +45,47 @@ def choose_grid_dim(block_count: int) -> int:
     return int(min(96, max(32, math.sqrt(block_count) * 8)))
 
 
-def greedy_fallback_positions(instance, grid_dim: int) -> List[Tuple[float, float, float, float]]:
-    env = GridPlacementEnv(instance, grid_dim=grid_dim)
-    square_idx = len(ASPECT_RATIOS) // 2
-    while not env.done():
-        if env.needs_aspect():
-            w, h = env.choose_aspect(square_idx)
-        else:
-            w, h = env.current_shape()
-        result = env.position_mask(w, h)
-        if result is None:
-            continue
-        mask, _, _ = result
-        valid = mask.nonzero(as_tuple=False)
-        gy, gx = int(valid[0, 0]), int(valid[0, 1])
-        env.place(gy, gx)
-    return compact(env.finalize(), instance.constraints)
+def greedy_fallback_positions(
+    instance, grid_dim: int,
+) -> List[Tuple[float, float, float, float]]:
+    """Always-succeeding placement, used only when every PPO rollout this
+    solve() call attempted failed to complete (rl/ppo.py's collect_episode
+    already degrades a single failed rollout to a flat -M_PENALTY reward
+    without crashing, so reaching here means the working canvas was too
+    tight for literally every attempt this budget allowed, not bad luck on
+    one draw). The first attempt uses GridPlacementEnv's own default sizing
+    (pins-based, see rl/env.py's _estimate_canvas_size); each retry after a
+    "canvas too small" error doubles an explicit (width, height) padding
+    pair instead, starting from CANVAS_PADDING -- since a wide enough
+    canvas always has room for any finite set of blocks, this is
+    guaranteed to terminate, so solve() can never crash here regardless of
+    how tight the instance's own pins turn out to be."""
+    canvas_padding: Optional[Tuple[float, float]] = None
+    last_error: Optional[RuntimeError] = None
+    for _ in range(10):
+        try:
+            env = GridPlacementEnv(instance, grid_dim=grid_dim, canvas_padding=canvas_padding)
+            square_idx = len(ASPECT_RATIOS) // 2
+            while not env.done():
+                if env.needs_aspect():
+                    w, h = env.choose_aspect(square_idx)
+                else:
+                    w, h = env.current_shape()
+                result = env.position_mask(w, h)
+                if result is None:
+                    continue
+                mask, _, _ = result
+                valid = mask.nonzero(as_tuple=False)
+                gy, gx = int(valid[0, 0]), int(valid[0, 1])
+                env.place(gy, gx)
+            return compact(env.finalize(), instance.constraints)
+        except RuntimeError as e:
+            last_error = e
+            if canvas_padding is None:
+                canvas_padding = (CANVAS_PADDING, CANVAS_PADDING)
+            else:
+                canvas_padding = (canvas_padding[0] * 2.0, canvas_padding[1] * 2.0)
+    raise RuntimeError(f"greedy fallback still failed after widening the canvas 10x: {last_error}")
 
 
 def finetune_and_solve(

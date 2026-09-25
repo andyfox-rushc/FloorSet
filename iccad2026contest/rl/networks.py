@@ -43,6 +43,15 @@ class AspectHead(nn.Module):
         x = torch.cat([block_embedding, global_embedding, progress.view(1)], dim=0)
         return self.mlp(x)
 
+    def forward_batch(self, block_embeddings, global_embeddings, progresses):
+        """Batched form of forward: [N, hidden] block/global embeddings +
+        [N] progress -> [N, num_aspects] logits. Used by ppo_update to
+        replace a per-transition Python loop (the dominant cost of a PPO
+        update -- ~90% of iteration wall time measured directly, dwarfing
+        rollout collection) with one batched matmul per epoch."""
+        x = torch.cat([block_embeddings, global_embeddings, progresses.unsqueeze(-1)], dim=-1)
+        return self.mlp(x)
+
 
 class PositionCNN(nn.Module):
     """Takes occupancy + cluster_grid + wiremask as spatial channels. Of
@@ -69,20 +78,54 @@ class PositionCNN(nn.Module):
         x = F.relu(self.conv2(x))
         return self.conv3(x)[0, 0]
 
+    def forward_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                       global_embeddings, progresses):
+        """Batched form of forward: [N, g, g] spatial channels + [N, hidden]
+        embeddings + [N] progress -> [N, g, g] logits. Conv2d already
+        natively supports a batch dimension -- forward() above just always
+        used batch size 1 (see ppo_update's per-transition loop this
+        replaces)."""
+        n, g, _ = occupancy.shape
+        ctx = torch.cat([block_embeddings, global_embeddings, progresses.unsqueeze(-1)], dim=-1)
+        emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
+        x = torch.stack([occupancy, cluster_grid, wiremask], dim=1)
+        x = torch.cat([x, emb_map], dim=1)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return self.conv3(x)[:, 0]
+
 
 class ScalarHead(nn.Module):
     """Shared shape for ValueNet and RewardApproxNet: pooled graph embedding
-    + progress -> scalar."""
+    + progress + reward committed so far this rollout -> scalar.
+
+    The third input matters more than it looks: `global_embedding` is fixed
+    per instance and `progress` is a deterministic function of how many
+    blocks have been placed (rl/ordering.py's order never depends on which
+    action was taken) -- so without `reward_so_far`, two different rollouts
+    of the SAME instance at the SAME step are otherwise indistinguishable
+    to this head, no matter how differently the placement actually went.
+    That left the value head unable to explain any of return_to_go's
+    within-episode variance, which a live diagnostic (2026-09-14) measured
+    at 10x-300x (avg ~44x-82x across two instances) the size of the actual
+    per-step signal PPO's advantage is supposed to isolate -- see
+    rl/ppo.py's ppo_update and algorithm.md's "Reward" section."""
 
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim + 2, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, global_embedding, progress):
-        x = torch.cat([global_embedding, progress.view(1)], dim=0)
+    def forward(self, global_embedding, progress, reward_so_far):
+        x = torch.cat([global_embedding, progress.view(1), reward_so_far.view(1)], dim=0)
+        return self.mlp(x).squeeze(-1)
+
+    def forward_batch(self, global_embeddings, progresses, rewards_so_far):
+        """Batched form of forward: [N, hidden] embeddings + [N] progress/
+        reward_so_far -> [N] scalars."""
+        x = torch.cat([global_embeddings, progresses.unsqueeze(-1), rewards_so_far.unsqueeze(-1)], dim=-1)
         return self.mlp(x).squeeze(-1)
 
 
@@ -111,8 +154,26 @@ class ActorCritic(nn.Module):
         return self.position_cnn(occupancy, cluster_grid, wiremask, block_embeddings[block_idx],
                                   global_embedding, progress)
 
-    def value(self, global_embedding, progress):
-        return self.value_head(global_embedding, progress)
+    def value(self, global_embedding, progress, reward_so_far):
+        return self.value_head(global_embedding, progress, reward_so_far)
 
-    def reward_approx(self, global_embedding, progress):
-        return self.reward_approx_head(global_embedding, progress)
+    def reward_approx(self, global_embedding, progress, reward_so_far):
+        return self.reward_approx_head(global_embedding, progress, reward_so_far)
+
+    def aspect_logits_batch(self, block_embeddings, global_embeddings, progresses):
+        """block_embeddings: [N, hidden] (already gathered per-transition by
+        the caller, since each transition may come from a different episode
+        with its own block embedding table); global_embeddings: [N, hidden];
+        progresses: [N]. See AspectHead.forward_batch."""
+        return self.aspect_head.forward_batch(block_embeddings, global_embeddings, progresses)
+
+    def position_logits_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                               global_embeddings, progresses):
+        return self.position_cnn.forward_batch(occupancy, cluster_grid, wiremask, block_embeddings,
+                                                global_embeddings, progresses)
+
+    def value_batch(self, global_embeddings, progresses, rewards_so_far):
+        return self.value_head.forward_batch(global_embeddings, progresses, rewards_so_far)
+
+    def reward_approx_batch(self, global_embeddings, progresses, rewards_so_far):
+        return self.reward_approx_head.forward_batch(global_embeddings, progresses, rewards_so_far)

@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from iccad2026_evaluate import ContestEvaluator  # noqa: E402
 from rl.data import from_training_batch_item, from_validation_sample  # noqa: E402
 from rl.networks import ActorCritic  # noqa: E402
-from rl.ppo import collect_batch, ppo_update  # noqa: E402
+from rl.ppo import collect_batch, make_episode_pool, ppo_update  # noqa: E402
 from rl.pretrain import collect_reward_prediction_corpus, pretrain_encoder_on_reward_prediction  # noqa: E402
 
 
@@ -93,6 +93,9 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--checkpoint", default="checkpoints/policy.pt")
     p.add_argument("--checkpoint-every", type=int, default=20)
+    p.add_argument("--time-limit-hours", type=float, default=None,
+                    help="Stop after this many wall-clock hours (checkpointing first), "
+                         "regardless of --iterations. Default: no limit.")
     p.add_argument("--resume", default=None)
     p.add_argument("--pretrain-instances", type=int, default=20,
                     help="Number of diverse instances used for the staged encoder "
@@ -100,6 +103,10 @@ def main():
                          "Ignored when --resume-ing an existing checkpoint.")
     p.add_argument("--pretrain-rollouts-per-instance", type=int, default=4)
     p.add_argument("--pretrain-epochs", type=int, default=5)
+    p.add_argument("--num-workers", type=int, default=1,
+                    help="Worker processes for parallel episode collection within each "
+                         "iteration (see rl/ppo.py's make_episode_pool). 1 (default) "
+                         "keeps the original single-process, sequential behavior.")
     args = p.parse_args()
 
     net = ActorCritic(hidden_dim=args.hidden_dim)
@@ -122,45 +129,70 @@ def main():
         print("  encoder warm-started; reward-approx head reset for PPO")
 
     optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
+    pool = make_episode_pool(args.num_workers, hidden_dim=args.hidden_dim) if args.num_workers > 1 else None
+    if pool is not None:
+        # NOTE: worker processes are only busy *during* collect_batch's
+        # pool.starmap call, which blocks this process until it returns --
+        # they're idle (no CPU use) while this process runs ppo_update
+        # afterward, so this process keeps its full default thread count for
+        # that phase rather than being capped alongside the workers.
+        print(f"episode collection: {args.num_workers} worker processes")
 
     ckpt_dir = os.path.dirname(args.checkpoint)
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
 
+    def save_checkpoint(it):
+        torch.save(net.state_dict(), args.checkpoint)
+        # Versioned snapshot alongside the canonical "latest" path above
+        # (which my_optimizer.py and --resume always load): a training
+        # run that suddenly destabilizes (see module docstring history --
+        # an overnight run's fallback rate jumped from ~3% to ~29%+ and
+        # never recovered) would otherwise have already overwritten the
+        # last healthy state by the time anyone notices.
+        history_dir = os.path.join(ckpt_dir or ".", "history")
+        os.makedirs(history_dir, exist_ok=True)
+        snapshot_path = os.path.join(history_dir, f"policy_iter{it:06d}.pt")
+        torch.save(net.state_dict(), snapshot_path)
+        print(f"  saved checkpoint -> {args.checkpoint} (+ {snapshot_path})")
+
+    time_limit_s = args.time_limit_hours * 3600 if args.time_limit_hours else None
+    last_it = 0
+
     t0 = time.time()
-    for it in range(1, args.iterations + 1):
-        inst = next(instances)
-        episodes = collect_batch(net, inst, grid_dim=args.grid_dim, use_baseline=True,
-                                  num_episodes=args.episodes_per_iter)
-        stats = ppo_update(net, optimizer, episodes, epochs=args.ppo_epochs)
-        avg_reward = sum(e.reward for e in episodes) / len(episodes)
-        del episodes  # drop references before the next iteration's allocations
+    try:
+        for it in range(1, args.iterations + 1):
+            if time_limit_s is not None and time.time() - t0 >= time_limit_s:
+                print(f"time limit of {args.time_limit_hours}h reached at iter {last_it}; stopping")
+                if last_it % args.checkpoint_every != 0:
+                    save_checkpoint(last_it)
+                break
+            inst = next(instances)
+            episodes = collect_batch(net, inst, grid_dim=args.grid_dim, use_baseline=True,
+                                      num_episodes=args.episodes_per_iter, pool=pool)
+            stats = ppo_update(net, optimizer, episodes, epochs=args.ppo_epochs)
+            avg_reward = sum(e.reward for e in episodes) / len(episodes)
+            del episodes  # drop references before the next iteration's allocations
 
-        rss_mb = None
-        if it % 50 == 0:
-            gc.collect()
-            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            rss_mb = None
+            if it % 50 == 0:
+                gc.collect()
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-        line = (f"iter {it}/{args.iterations} blocks={inst.block_count} "
-                f"avg_reward={avg_reward:.4f} loss={stats['loss']:.4f} "
-                f"grad_norm={stats['grad_norm']:.4f} elapsed={time.time() - t0:.1f}s")
-        if rss_mb is not None:
-            line += f" rss_mb={rss_mb:.1f}"
-        print(line)
+            line = (f"iter {it}/{args.iterations} blocks={inst.block_count} "
+                    f"avg_reward={avg_reward:.4f} loss={stats['loss']:.4f} "
+                    f"grad_norm={stats['grad_norm']:.4f} elapsed={time.time() - t0:.1f}s")
+            if rss_mb is not None:
+                line += f" rss_mb={rss_mb:.1f}"
+            print(line)
 
-        if it % args.checkpoint_every == 0 or it == args.iterations:
-            torch.save(net.state_dict(), args.checkpoint)
-            # Versioned snapshot alongside the canonical "latest" path above
-            # (which my_optimizer.py and --resume always load): a training
-            # run that suddenly destabilizes (see module docstring history --
-            # an overnight run's fallback rate jumped from ~3% to ~29%+ and
-            # never recovered) would otherwise have already overwritten the
-            # last healthy state by the time anyone notices.
-            history_dir = os.path.join(ckpt_dir or ".", "history")
-            os.makedirs(history_dir, exist_ok=True)
-            snapshot_path = os.path.join(history_dir, f"policy_iter{it:06d}.pt")
-            torch.save(net.state_dict(), snapshot_path)
-            print(f"  saved checkpoint -> {args.checkpoint} (+ {snapshot_path})")
+            last_it = it
+            if it % args.checkpoint_every == 0 or it == args.iterations:
+                save_checkpoint(it)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
 
 if __name__ == "__main__":

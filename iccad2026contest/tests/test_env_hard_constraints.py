@@ -30,6 +30,21 @@ def check_overlap(positions):
     return True
 
 
+def test_canvas_padding_pair_produces_a_non_square_canvas():
+    # An explicit (width_padding, height_padding) pair should size
+    # x_max-x_min and y_max-y_min independently, not force a square canvas
+    # the way a single scalar (or the module default) does.
+    inst = synthetic_instance(area_targets=[4.0, 9.0, 16.0, 6.0])
+    square_env = GridPlacementEnv(inst, grid_dim=16)
+    assert abs((square_env.x_max - square_env.x_min) - (square_env.y_max - square_env.y_min)) < 1e-9
+
+    non_square_env = GridPlacementEnv(inst, grid_dim=16, canvas_padding=(1.0, 2.5))
+    width = non_square_env.x_max - non_square_env.x_min
+    height = non_square_env.y_max - non_square_env.y_min
+    assert width < height, "smaller width_padding should produce a narrower canvas"
+    assert abs((width / height) - (1.0 / 2.5)) < 1e-6
+
+
 def test_random_rollout_is_overlap_free(rollout):
     areas = [4.0, 9.0, 16.0, 6.0, 12.0, 3.0, 8.0]
     inst = synthetic_instance(area_targets=areas)

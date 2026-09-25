@@ -60,11 +60,57 @@ def test_preplaced_block_never_moves():
     assert check_overlap(result)
 
 
-def test_clustered_blocks_never_move():
+def test_clustered_group_with_no_other_content_does_not_move():
+    # Degenerate case: the cluster IS the whole layout, so the floor is
+    # defined by its own leftmost/bottommost member -- nothing to compact
+    # toward, so it correctly stays put.
     positions = [(10.0, 10.0, 2.0, 2.0), (50.0, 50.0, 2.0, 2.0)]
     constraints = torch.tensor([[0, 0, 0, 1, 0], [0, 0, 0, 1, 0]], dtype=torch.float32)
     result = compact(positions, constraints)
     assert result == positions
+
+
+def test_clustered_group_slides_rigidly_toward_other_content():
+    # A free anchor block near the origin, and a two-member cluster (already
+    # mutually touching, as rl/env.py's _try_cluster_touch guarantees) sitting
+    # far away with a big gap. The whole cluster should slide left as one
+    # rigid unit until the first member touches the anchor -- closing the
+    # gap while keeping the cluster's internal arrangement byte-for-byte
+    # identical (a pure translation).
+    positions = [
+        (0.0, 0.0, 2.0, 2.0),    # free anchor
+        (50.0, 0.0, 2.0, 2.0),   # cluster member 1 (touches member 2)
+        (52.0, 0.0, 2.0, 2.0),   # cluster member 2
+    ]
+    constraints = torch.tensor(
+        [[0, 0, 0, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 1, 0]], dtype=torch.float32)
+    result = compact(positions, constraints)
+    assert check_overlap(result)
+    # Relative arrangement inside the cluster is exactly preserved.
+    assert abs((result[2][0] - result[1][0]) - (positions[2][0] - positions[1][0])) < 1e-6
+    # The cluster moved left, closing (most of) the gap against the anchor.
+    assert result[1][0] < positions[1][0]
+    assert result[1][0] <= positions[0][0] + positions[0][2] + 1e-6
+
+
+def test_clustered_group_never_overlaps_other_content_while_sliding():
+    # The "blocker" is itself a free block, so it also compacts toward the
+    # anchor -- the cluster then has to catch up to its NEW position, which
+    # takes more than one pass. The only real invariant to check is safety
+    # (never overlaps), not a specific final x.
+    positions = [
+        (0.0, 0.0, 3.0, 3.0),      # free anchor
+        (10.0, 0.0, 3.0, 3.0),     # free blocker between anchor and cluster
+        (40.0, 0.0, 3.0, 3.0),     # cluster member 1
+        (43.0, 0.0, 3.0, 3.0),     # cluster member 2
+    ]
+    constraints = torch.tensor(
+        [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 1, 0]],
+        dtype=torch.float32)
+    result = compact(positions, constraints)
+    assert check_overlap(result)
+    # Cluster caught up to the blocker's final (also-compacted) position.
+    assert abs(result[2][0] - (result[1][0] + result[1][2])) < 1e-6
 
 
 def test_right_pinned_block_is_pulled_in_to_close_the_gap():

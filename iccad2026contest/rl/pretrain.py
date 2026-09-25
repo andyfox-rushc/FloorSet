@@ -33,6 +33,7 @@ class RewardPredictionSample:
     b2b_edges: torch.Tensor
     p2b_edges: torch.Tensor
     progress: float
+    reward_so_far: float
     reward: float
 
 
@@ -59,11 +60,18 @@ def collect_reward_prediction_corpus(
 
         for _ in range(rollouts_per_instance):
             ep = collect_episode(net, inst, grid_dim=grid_dim, use_baseline=use_baseline)
-            progresses = [tr.progress for tr in ep.transitions] or [0.0]
-            for progress in progresses:
+            if not ep.transitions:
                 samples.append(RewardPredictionSample(
-                    block_feats, pin_feats, ep.b2b_edges, ep.p2b_edges, progress, ep.reward,
+                    block_feats, pin_feats, ep.b2b_edges, ep.p2b_edges, 0.0, 0.0, ep.reward,
                 ))
+                continue
+            reward_so_far = 0.0
+            for tr in ep.transitions:
+                samples.append(RewardPredictionSample(
+                    block_feats, pin_feats, ep.b2b_edges, ep.p2b_edges,
+                    tr.progress, reward_so_far, ep.reward,
+                ))
+                reward_so_far += tr.step_reward
     return samples
 
 
@@ -96,7 +104,8 @@ def pretrain_encoder_on_reward_prediction(
             for i in batch_idx:
                 s = corpus[i]
                 _, global_emb = net.encode(s.block_feats, s.pin_feats, s.b2b_edges, s.p2b_edges)
-                pred = net.reward_approx(global_emb, torch.tensor(s.progress, dtype=torch.float32))
+                pred = net.reward_approx(global_emb, torch.tensor(s.progress, dtype=torch.float32),
+                                          torch.tensor(s.reward_so_far, dtype=torch.float32))
                 batch_loss = batch_loss + (pred - s.reward) ** 2
             batch_loss = batch_loss / len(batch_idx)
             batch_loss.backward()

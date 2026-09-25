@@ -4,7 +4,8 @@ import pytest
 
 from iccad2026_evaluate import ALPHA, BETA, M_PENALTY, evaluate_solution
 from rl.data import synthetic_instance
-from rl.reward import inference_reward, pretraining_reward, step_quality_delta
+from rl.reward import (_reward_and_violation_factor, inference_reward, pretraining_reward,
+                        step_quality_delta)
 
 
 def test_pretraining_reward_matches_uncapped_quality_formula():
@@ -62,11 +63,17 @@ def test_inference_reward_feasible_case_matches_manual_formula():
     assert reward == pytest.approx(expected)
 
 
-def test_inference_reward_infeasible_case_is_m_penalty():
+def test_inference_reward_infeasible_case_scales_with_violation_count():
+    # A flat -M_PENALTY regardless of severity gives PPO zero gradient
+    # signal toward "less infeasible" -- the same zero-signal-plateau bug
+    # already fixed for pretraining_reward's feasible-but-bad case (see
+    # module docstring), just on the infeasible branch instead. Both
+    # inference_reward's infeasible branch now scale with hard_violations,
+    # so two differently-bad infeasible layouts are distinguishable.
     inst = synthetic_instance(area_targets=[4.0, 9.0])
     overlapping = [(0.0, 0.0, 2.0, 2.0), (1.0, 1.0, 3.0, 3.0)]
     reward = inference_reward(inst, overlapping)
-    assert reward == pytest.approx(-M_PENALTY)
+    assert reward < -M_PENALTY  # strictly worse than the flat floor, not equal to it
 
 
 def test_inference_reward_does_not_require_baseline():
@@ -74,6 +81,38 @@ def test_inference_reward_does_not_require_baseline():
     assert inst.baseline_metrics is None
     # should not raise
     inference_reward(inst, [(0.0, 0.0, 2.0, 2.0), (2.0, 0.0, 3.0, 3.0)])
+
+
+def test_violation_factor_rescale_gives_a_bounded_residual():
+    # Before the credit-assignment fix, rl/ppo.py's collect_episode had to
+    # absorb the ENTIRE quality*violation interaction into one residual on a
+    # single transition: old_residual = -V + ALPHA*Q*(1-V), unbounded in Q.
+    # The fix rescales every step's tracked delta by V first, so the only
+    # leftover is -V (Q-independent) -- see rl/reward.py's
+    # _reward_and_violation_factor docstring for the derivation. This test
+    # deliberately engineers both a huge Q (near-zero baseline) and a real
+    # V > 1 (an unsatisfied cluster-touch constraint) so the two formulas'
+    # outputs are dramatically, unmistakably different.
+    baseline = {'hpwl_baseline': 1e-4, 'area_baseline': 1e-4}
+    inst = synthetic_instance(
+        area_targets=[4.0, 4.0],
+        constraints=[[0, 0, 0, 1, 0], [0, 0, 0, 1, 0]],  # same cluster, must touch
+        b2b_edges=[(0, 1, 5.0)],
+        baseline_metrics=baseline,
+    )
+    positions = [(0.0, 0.0, 2.0, 2.0), (50.0, 0.0, 2.0, 2.0)]  # far apart -> violates grouping
+
+    reward, violation_factor = _reward_and_violation_factor(inst, positions, use_baseline=True)
+    assert violation_factor > 1.0 + 1e-6  # confirm the setup actually produced a real violation
+
+    Q = (-reward / violation_factor - 1) / ALPHA
+    assert Q > 10  # confirm the near-zero baseline actually produced a huge gap
+
+    old_residual = -violation_factor + ALPHA * Q * (1 - violation_factor)
+    new_residual = -violation_factor
+
+    assert abs(new_residual) == pytest.approx(violation_factor)
+    assert abs(new_residual) < abs(old_residual) / 10
 
 
 def test_step_quality_delta_pretraining_matches_alpha_weighting():

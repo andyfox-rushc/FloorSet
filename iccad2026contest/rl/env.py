@@ -41,11 +41,24 @@ Guarantees:
                 to a plain free mask -- both of which are grid-dilation
                 based and can select a merely-nearby (even corner-only)
                 cell that doesn't actually count as touching.
+
+                A block that's BOTH boundary-pinned AND clustered runs the
+                same touch search first, filtered to candidates that also
+                satisfy its own boundary bit(s) -- fixed 2026-09-21 after
+                validation-set data showed clusters with 2+ boundary-pinned
+                members failing to stay connected 97.8% of the time
+                (45/46), vs. 46.5% for ordinary clusters. The prior version
+                only ever ran the touch search when `boundary_code == 0`,
+                so a boundary-pinned cluster member never even attempted to
+                satisfy grouping -- each one independently picked any free
+                cell on its required edge, with zero regard for where its
+                clustermates were. See [[floorset-grouping]] memory (or
+                this commit's message) for the full diagnosis.
 """
 
 import math
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -57,11 +70,73 @@ from .ordering import PlacementStep, compute_order
 
 DEFAULT_GRID_DIM = 48
 # Slack beyond total block area for placement to always fit. Was 2.2
-# (~4.84x area) -- an undertrained policy's bbox matched that ceiling almost
-# exactly instead of packing tight; 1.5 (~2.25x) halves the free spreading room.
-CANVAS_PADDING = 1.5
+# (~4.84x area), then 1.5 (~2.25x); lowered to 1.4 (~1.96x) 2026-09-20 to
+# test whether a tighter working canvas -- combined with the fixed per-step
+# credit assignment (violation_factor now correctly propagated, see
+# rl/ppo.py) -- reduces the block-50-style pattern where a boundary-pinned
+# block anchors to this canvas's edge (rl/env.py's _boundary_mask, set once
+# here before any placement happens) far from where the interior mass ends
+# up settling. 1.2 was tried first and rejected outright: it reproduced the
+# exact catastrophic whole-batch avg_reward=-10.0000 flatline this project
+# already fixed once, but for a different reason (canvas too small to
+# complete most rollouts at all, not reward-capping) -- confirmed by
+# test_ppo_overfit.py and most of test_env_real_data.py's validation-set
+# stress tests failing outright even with 20 random-seed retries per
+# instance. 1.35 still failed 9/192 tests (specific instances with an
+# extreme-aspect-ratio block). 1.4 passes the full suite cleanly, so this
+# is the tightest value tried that doesn't break basic feasibility -- see
+# training-history notes for whether it actually helps. Now only a
+# fallback -- see GridPlacementEnv._estimate_canvas_size -- for the rare
+# instance with too few usable pins to size from directly.
+CANVAS_PADDING = 1.4
 # Log-spaced aspect ratio buckets (w/h); index 4 == square.
 ASPECT_RATIOS = [0.2, 0.3, 0.45, 0.67, 1.0, 1.5, 2.22, 3.33, 5.0]
+
+# Target utilization (total block area / working canvas area) used to size
+# the canvas -- see GridPlacementEnv._estimate_canvas_size. SHAPE (aspect
+# ratio) and AREA are deliberately estimated from two different, exact
+# sources rather than one multiplicative fudge factor on the pin bbox:
+#   - shape: pins_pos's own bounding-box ratio (validated across the
+#     validation set: median 5.4%, mean 6.0%, max 17.5% relative error vs
+#     the true ground-truth ratio -- a real per-instance shape signal).
+#   - area: area_targets.sum() (the EXACT total block area already in the
+#     problem input) divided by this utilization target, not the pin
+#     bbox's own area (which itself carries ~22% inflation over true area
+#     on average -- compounding two approximations was needless).
+# A prior version multiplied the pin bbox by one linear-per-dimension
+# margin (PIN_SAFETY_MARGIN / PIN_AREA_MARGIN) -- this conflated shape and
+# area uncertainty into one knob and, worse, the very first form of it
+# applied the margin per-dimension, which compounds into AREA^2: 1.4 per
+# dimension produced a median canvas area of 2.4x (mean 2.395x, max
+# 2.756x) the true ground-truth bbox area, caught 2026-09-21 when a
+# stranded-block pattern (test-98's block 50) persisted even after the
+# canvas SHAPE already closely matched ground truth, pointing at excess
+# SIZE, not shape, as the remaining problem.
+# UTILIZATION_TARGET itself: real ground-truth utilization in this
+# dataset is ~0.97 (FloorSet-Lite's own <5% whitespace target), but that's
+# the tightly-PACKED final answer, not a safe construction-time budget --
+# same lesson as CANVAS_PADDING's own history (a size just enough for the
+# tight optimum is not enough for a foresight-free construction process).
+# AlphaChip itself reportedly targets 60-80% utilization, but that number
+# doesn't transfer here: AlphaChip's RL agent places only fixed hard
+# macros, with standard cells filled into the remaining whitespace
+# afterward by a separate, non-RL, force-directed method -- our RL policy
+# places EVERY block itself, sequentially, with no such downstream filler
+# to lean on, so it needs more room during construction than AlphaChip's
+# macro-only placement phase does.
+# Ground-truth-undershoot alone is a weak bar (0/100 undershoot for
+# U=0.5-0.8 in a validation-set scan) -- U=0.7 (area/gt_area ~1.39x) still
+# collapsed the REAL test suite (99/193 failed, almost all uniform-random
+# rollout stress tests) despite passing that weaker check cleanly. U=0.5
+# (area/gt_area ~1.94x) passes the full suite (193/193) -- consistent with
+# CANVAS_PADDING=1.4's own independently-tuned safe area (~1.90x
+# ground-truth area, backing out its sqrt(total_area) formula against this
+# dataset's real ~0.97 utilization), a useful cross-check that this number
+# is real and not an artifact of one particular estimation method.
+UTILIZATION_TARGET = 0.5
+# Below this many valid (non-sentinel) pins, the bounding box they'd give
+# is too small a sample to trust -- fall back to the old formula instead.
+MIN_VALID_PINS = 2
 
 
 def _rect_overlap(a, b) -> bool:
@@ -74,13 +149,68 @@ def _rect_overlap(a, b) -> bool:
 
 class GridPlacementEnv:
     def __init__(self, instance: FloorplanInstance, grid_dim: int = DEFAULT_GRID_DIM,
-                 aspect_ratios: List[float] = ASPECT_RATIOS):
+                 aspect_ratios: List[float] = ASPECT_RATIOS,
+                 canvas_padding: Optional[Union[float, Tuple[float, float]]] = None):
         self.instance = instance
         self.grid_dim = grid_dim
         self.aspect_ratios = aspect_ratios
+        # An explicit override skips the pins-based sizing below entirely
+        # (see reset()) and forces the old sqrt(total_area)*padding formula
+        # -- used by rl/finetune.py's greedy_fallback_positions to widen the
+        # working canvas on retry when even the default turns out too
+        # tight. Accepts a single float (both dimensions the same) or a
+        # (width_padding, height_padding) pair.
+        self._explicit_padding = canvas_padding is not None
+        if canvas_padding is None:
+            self.width_padding = self.height_padding = CANVAS_PADDING
+        elif isinstance(canvas_padding, tuple):
+            self.width_padding, self.height_padding = canvas_padding
+        else:
+            self.width_padding = self.height_padding = canvas_padding
         self.plan = compute_order(instance.constraints, instance.area_targets,
                                    instance.b2b_connectivity)
         self.reset()
+
+    def _estimate_canvas_size(self, inst: FloorplanInstance) -> Tuple[float, float]:
+        """The working canvas's width/height, before any block is placed.
+
+        Primary method: SHAPE from the instance's own pins (`pins_pos`,
+        given in the problem input -- real I/O pins sit at or near the
+        physical die edge, so their bounding-box ratio closely tracks the
+        true floorplan's aspect ratio), AREA from `area_targets.sum()` (the
+        exact total block-area budget already in the problem input)
+        divided by UTILIZATION_TARGET. This needs no estimation, training,
+        or scouting for either quantity -- unlike every other approach
+        tried this session (fixed padding, an online-learned EMA, a
+        policy-driven scout rollout, a simulated-annealing scout), both are
+        exact data already in hand before placement starts. See
+        UTILIZATION_TARGET for the validation-set numbers behind this
+        design and its target value.
+
+        Skipped (falls through to the old sqrt(total_area)*padding
+        formula) when an explicit `canvas_padding` override was given
+        (see __init__ -- used by greedy_fallback_positions's widen-on-
+        failure retry, which needs to force a specific size regardless of
+        pins) or when the instance has too few valid pins to trust for
+        shape."""
+        if not self._explicit_padding:
+            pins = inst.pins_pos
+            if pins is not None and pins.numel() > 0:
+                valid = pins[(pins[:, 0] != -1) | (pins[:, 1] != -1)]
+                if valid.shape[0] >= MIN_VALID_PINS:
+                    pin_w = float((valid[:, 0].max() - valid[:, 0].min()).item())
+                    pin_h = float((valid[:, 1].max() - valid[:, 1].min()).item())
+                    if pin_w > 0 and pin_h > 0:
+                        total_block_area = float(inst.area_targets.clamp(min=0).sum().item())
+                        canvas_area = max(total_block_area, 1.0) / UTILIZATION_TARGET
+                        ratio = pin_w / pin_h
+                        est_width = math.sqrt(canvas_area * ratio)
+                        est_height = canvas_area / est_width
+                        return est_width, est_height
+
+        total_area = float(inst.area_targets.clamp(min=0).sum().item())
+        scale = math.sqrt(max(total_area, 1.0))
+        return scale * self.width_padding, scale * self.height_padding
 
     # ------------------------------------------------------------------
     # Setup
@@ -105,13 +235,12 @@ class GridPlacementEnv:
                 xs1.append(x + w)
                 ys1.append(y + h)
 
-        total_area = float(inst.area_targets.clamp(min=0).sum().item())
-        est_side = math.sqrt(max(total_area, 1.0)) * CANVAS_PADDING
+        est_width, est_height = self._estimate_canvas_size(inst)
 
         self.x_min = min(xs0)
         self.y_min = min(ys0)
-        self.x_max = max([self.x_min + est_side] + xs1)
-        self.y_max = max([self.y_min + est_side] + ys1)
+        self.x_max = max([self.x_min + est_width] + xs1)
+        self.y_max = max([self.y_min + est_height] + ys1)
 
         self.cell_w = (self.x_max - self.x_min) / self.grid_dim
         self.cell_h = (self.y_max - self.y_min) / self.grid_dim
@@ -278,8 +407,8 @@ class GridPlacementEnv:
         cid = step.cluster_id
         self._boundary_pin_ok = False
 
-        if step.boundary_code == 0 and cid and self.cluster_cells.get(cid):
-            touch = self._try_cluster_touch(cid, w, h)
+        if cid and self.cluster_cells.get(cid):
+            touch = self._try_cluster_touch(cid, w, h, code=step.boundary_code)
             if touch is not None:
                 x, y = touch
                 self._commit(x, y, w, h)
@@ -426,7 +555,43 @@ class GridPlacementEnv:
         for k in range(k_lo, k_hi + 1):
             yield anchor + k * step
 
-    def _try_cluster_touch(self, cid, w, h):
+    def _x_bit_satisfied(self, x, w, code) -> bool:
+        """True if x-coordinate `x` satisfies code's left(1)/right(2) bit,
+        if any (assumes at most one is set -- see _try_cluster_touch)."""
+        eps = 1e-6
+        if code & 1 and abs(x - self.x_min) > eps:
+            return False
+        if code & 2 and abs(x + w - self.x_max) > eps:
+            return False
+        return True
+
+    def _y_bit_satisfied(self, y, h, code) -> bool:
+        """Mirror of _x_bit_satisfied for top(4)/bottom(8)."""
+        eps = 1e-6
+        if code & 4 and abs(y + h - self.y_max) > eps:
+            return False
+        if code & 8 and abs(y - self.y_min) > eps:
+            return False
+        return True
+
+    def _forced_x(self, w, code) -> Optional[float]:
+        """The x-coordinate code's left/right bit forces, or None if
+        neither bit is set (caller should search x freely instead)."""
+        if code & 1:
+            return self.x_min
+        if code & 2:
+            return self.x_max - w
+        return None
+
+    def _forced_y(self, h, code) -> Optional[float]:
+        """Mirror of _forced_x for top/bottom."""
+        if code & 4:
+            return self.y_max - h
+        if code & 8:
+            return self.y_min
+        return None
+
+    def _try_cluster_touch(self, cid, w, h, code=0):
         """Exact geometric touch against an already-placed clustermate --
         see the module docstring's Grouping guarantee.
 
@@ -447,26 +612,59 @@ class GridPlacementEnv:
         higher than the fallback counter, which this exhaustive search
         directly targets). Trying every grid-aligned offset along that
         range before moving to the next neighbor/side finds a real touch
-        far more often, without ever weakening the overlap check itself."""
+        far more often, without ever weakening the overlap check itself.
+
+        `code`, if nonzero (the block is ALSO boundary-pinned -- see
+        position_mask), additionally requires the touch to land on the
+        block's required edge(s). The axis the touch search already fixes
+        (e.g. cx = nx+nw when touching a neighbor's right side) is just
+        checked against that axis's bit; the FREE axis (cy in that same
+        example) is not searched at all when code constrains it -- it's
+        computed directly from the exact required coordinate (e.g.
+        self.y_max - h), since that's almost never a value _grid_values'
+        neighbor-relative stepping would happen to land on by chance (a
+        bug in an earlier version of this fix: filtering the generic
+        enumeration instead of solving for the exact required value meant
+        it essentially never found a real candidate, even for same-edge
+        pairs). boundary_code encodes at most one bit per axis (corners
+        are one x-bit + one y-bit, e.g. 5 = top-left = 4+1), so each axis
+        has a single well-defined forced value when constrained."""
         n = self.instance.block_count
         ncols = self.instance.constraints.shape[1]
         cluster_col = self.instance.constraints[:, 3] if ncols > 3 else torch.zeros(n)
         neighbors = [self.positions[j] for j in range(n)
                      if self.positions[j] is not None and int(cluster_col[j]) == cid]
         for (nx, ny, nw, nh) in neighbors:
+            # Touch on the neighbor's left/right side: cx is fixed by the
+            # touch itself, cy is otherwise free.
             y_lo, y_hi = max(self.y_min, ny - h), min(self.y_max - h, ny + nh)
             for cx in (nx + nw, nx - w):
                 if cx < self.x_min - 1e-9 or cx + w > self.x_max + 1e-9:
                     continue
-                for cy in self._grid_values(y_lo, y_hi, self.cell_h, ny):
+                if code and not self._x_bit_satisfied(cx, w, code):
+                    continue
+                forced_cy = self._forced_y(h, code) if code else None
+                if forced_cy is not None:
+                    cy_candidates = [forced_cy] if y_lo - 1e-9 <= forced_cy <= y_hi + 1e-9 else []
+                else:
+                    cy_candidates = self._grid_values(y_lo, y_hi, self.cell_h, ny)
+                for cy in cy_candidates:
                     candidate = (cx, cy, w, h)
                     if not any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
                         return cx, cy
+            # Touch on the neighbor's top/bottom side: cy is fixed, cx free.
             x_lo, x_hi = max(self.x_min, nx - w), min(self.x_max - w, nx + nw)
             for cy in (ny + nh, ny - h):
                 if cy < self.y_min - 1e-9 or cy + h > self.y_max + 1e-9:
                     continue
-                for cx in self._grid_values(x_lo, x_hi, self.cell_w, nx):
+                if code and not self._y_bit_satisfied(cy, h, code):
+                    continue
+                forced_cx = self._forced_x(w, code) if code else None
+                if forced_cx is not None:
+                    cx_candidates = [forced_cx] if x_lo - 1e-9 <= forced_cx <= x_hi + 1e-9 else []
+                else:
+                    cx_candidates = self._grid_values(x_lo, x_hi, self.cell_w, nx)
+                for cx in cx_candidates:
                     candidate = (cx, cy, w, h)
                     if not any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
                         return cx, cy
