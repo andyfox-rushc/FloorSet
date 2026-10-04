@@ -188,7 +188,7 @@ def test_cluster_members_end_up_touching(rollout):
 def test_no_free_position_raises_clear_error():
     # A single block whose area vastly exceeds the tiny canvas/grid we hand it.
     inst = synthetic_instance(area_targets=[1_000_000.0])
-    env = GridPlacementEnv(inst, grid_dim=4)
+    env = GridPlacementEnv(inst, grid_dim=4, fine_factor=1)
     # Force an undersized canvas directly to exercise the guard.
     env.x_max = env.x_min + 1.0
     env.y_max = env.y_min + 1.0
@@ -262,7 +262,7 @@ def test_step_deltas_zero_wirelength_for_first_placed_block():
 
 def test_step_deltas_match_manual_wirelength_and_area_for_second_block():
     inst = synthetic_instance(area_targets=[4.0, 4.0], b2b_edges=[(0, 1, 2.0)])
-    env = GridPlacementEnv(inst, grid_dim=10)
+    env = GridPlacementEnv(inst, grid_dim=10, fine_factor=1)
     env.x_max, env.y_max = 10.0, 10.0
     env.cell_w = env.cell_h = 1.0
 

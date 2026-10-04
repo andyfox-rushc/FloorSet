@@ -231,6 +231,29 @@ def _shift_group_y(pos: List[List[float]], group: List[int], floor: float) -> No
             pos[i][1] = new_y
 
 
+def _push_out(pos: List[List[float]], group: List[int], axis: int) -> None:
+    """Slide each right- (axis 0) or top-pinned (axis 1) block outward to
+    the layout's far edge when the path there is clear. Compaction's other
+    moves only go toward the origin, so a block pinned to a die edge that
+    other content overhangs would otherwise miss the bbox edge."""
+    other = 1 - axis
+    edge = max(p[axis] + p[axis + 2] for p in pos)
+    for i in group:
+        p = pos[i]
+        gap = edge - (p[axis] + p[axis + 2])
+        if gap <= _EPS:
+            continue
+        lo, hi = p[other], p[other] + p[other + 2]
+        room = gap
+        for j, q in enumerate(pos):
+            if j == i or q[other] >= hi - _EPS or q[other] + q[other + 2] <= lo + _EPS:
+                continue
+            if q[axis] >= p[axis] + p[axis + 2] - _EPS:
+                room = min(room, q[axis] - (p[axis] + p[axis + 2]))
+        if room >= gap - _EPS:
+            p[axis] += gap
+
+
 def compact(
     positions: List[Position],
     constraints: Optional[torch.Tensor],
@@ -296,5 +319,7 @@ def compact(
             _shift_cluster_y(pos, group, floor_y)
         _sweep_y(pos, immovable_y, floor_y)
         _shift_group_y(pos, top_group, floor_y)
+    _push_out(pos, right_group, 0)
+    _push_out(pos, top_group, 1)
 
     return [tuple(p) for p in pos]

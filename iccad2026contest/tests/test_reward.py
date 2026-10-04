@@ -152,3 +152,68 @@ def test_step_quality_delta_sums_to_pretraining_reward_before_the_floor():
                                 use_baseline=True, baseline_metrics=baseline)
 
     assert (step0 + step1) == pytest.approx(-ALPHA * (wl / 5.0 + full_bbox_area / 20.0))
+
+
+# -- normalized inference_reward (reference_metrics set) --------------------
+
+def _referenced_instance(hpwl_ref=10.0, area_ref=30.0):
+    inst = synthetic_instance(area_targets=[4.0, 9.0], b2b_edges=[(0, 1, 2.0)])
+    inst.reference_metrics = {'hpwl_ref': hpwl_ref, 'area_ref': area_ref}
+    return inst
+
+
+def test_normalized_inference_reward_matches_ratio_formula():
+    inst = _referenced_instance()
+    positions = [(0.0, 0.0, 2.0, 2.0), (2.0, 0.0, 3.0, 3.0)]
+    hpwl = 2.0 * (abs(3.5 - 1.0) + abs(1.5 - 1.0))
+    bbox_area = 5.0 * 3.0
+    expected = -(1 + ALPHA * (hpwl / 10.0 + bbox_area / 30.0))
+    assert inference_reward(inst, positions) == pytest.approx(expected)
+
+
+def test_normalized_step_deltas_use_the_reference():
+    delta = step_quality_delta(delta_wl=3.0, delta_area=10.0, use_baseline=False,
+                                baseline_metrics=None,
+                                reference_metrics={'hpwl_ref': 6.0, 'area_ref': 40.0})
+    assert delta == pytest.approx(-ALPHA * (3.0 / 6.0 + 10.0 / 40.0))
+
+
+def test_normalized_infeasible_penalty_stays_below_bad_feasible_rewards():
+    # The bug this guards: a failed rollout (-M_PENALTY) used to outscore
+    # every feasible one at fine-tune time. With max violations
+    # (violation_factor = e^BETA) and quality 5x the reference, a feasible
+    # rollout must still beat an infeasible one.
+    inst = _referenced_instance()
+    overlapping = [(0.0, 0.0, 2.0, 2.0), (1.0, 1.0, 3.0, 3.0)]
+    worst_plausible_feasible = -(1 + ALPHA * (5.0 + 5.0)) * math.exp(BETA)
+    assert inference_reward(inst, overlapping) < worst_plausible_feasible
+
+
+def test_unfinished_rollout_gets_scaled_penalty_under_reference():
+    from rl.networks import ActorCritic
+    from rl.ppo import collect_episode
+    # 2x2 grid can't hold three blocks of a 10x-too-small canvas -> the
+    # rollout aborts and must get the scaled penalty, not the flat -10.
+    inst = synthetic_instance(area_targets=[100.0, 100.0, 100.0], b2b_edges=[(0, 1, 1.0)])
+    inst.reference_metrics = {'hpwl_ref': 10.0, 'area_ref': 300.0}
+    import rl.env as env_mod
+    original = env_mod.CANVAS_PADDING
+    env_mod.CANVAS_PADDING = 0.3
+    try:
+        ep = collect_episode(ActorCritic(hidden_dim=16, num_gnn_layers=1, cnn_channels=4),
+                             inst, grid_dim=8, use_baseline=False)
+    finally:
+        env_mod.CANVAS_PADDING = original
+    assert ep.positions is None
+    assert ep.reward == pytest.approx(-M_PENALTY * math.exp(BETA))
+
+
+def test_training_failure_penalty_is_graded_by_progress():
+    from rl.reward import FAIL_FLOOR, infeasible_penalty
+    from iccad2026_evaluate import M_PENALTY
+    inst = None
+    assert infeasible_penalty(inst, True, placed_fraction=1.0) == pytest.approx(-FAIL_FLOOR)
+    assert infeasible_penalty(inst, True, placed_fraction=0.0) == pytest.approx(-M_PENALTY)
+    mid = infeasible_penalty(inst, True, placed_fraction=0.5)
+    assert -M_PENALTY < mid < -FAIL_FLOOR
+    assert infeasible_penalty(inst, True) == pytest.approx(-M_PENALTY)   # no progress info: flat

@@ -54,12 +54,17 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from iccad2026_evaluate import FloorplanOptimizer
+from rl.checkpoint_meta import utilization_ladder
 from rl.anneal import anneal_polish
+from rl.repack import repack_polish
+from rl.slicing import slicing_polish
 from rl.data import from_solve_args
 from rl.finetune import finetune_and_solve
-from rl.networks import ActorCritic
+from rl.networks import ActorCritic, load_state
 
-DEFAULT_CHECKPOINT = str(Path(__file__).parent / "checkpoints" / "policy.pt")
+# FLOORSET_CHECKPOINT overrides, e.g. to evaluate a fixed history snapshot.
+DEFAULT_CHECKPOINT = os.environ.get(
+    "FLOORSET_CHECKPOINT", str(Path(__file__).parent / "checkpoints" / "policy.pt"))
 
 
 class MyOptimizer(FloorplanOptimizer):
@@ -71,25 +76,33 @@ class MyOptimizer(FloorplanOptimizer):
     def __init__(
         self,
         verbose: bool = False,
-        time_budget: float = 20.0,
+        # 09-28 sweep, 100 designs: 20+8 s -> 1.607 at 28.9 s, 2+1 s -> 1.643
+        # at 4.3 s; with the runtime factor (runtime/median)^0.3, 2+1 wins
+        # for any median runtime >= 10 s (budget_sweep_0928*.json).
+        time_budget: float = 2.0,
         max_iterations: int = 150,
         episodes_per_iter: int = 6,
         ppo_epochs: int = 3,
-        anneal_time_budget: float = 8.0,
+        anneal_time_budget: float = 1.0,
+        polish: str = os.environ.get("FLOORSET_POLISH", "slice+repack"),
         checkpoint_path: Optional[str] = None,
     ):
         super().__init__(verbose)
+        # Rollout ops are small; extra threads only add overhead, and on a
+        # busy machine they oversubscribe cores (50x slower, measured 09-26).
+        torch.set_num_threads(1)
         self.time_budget = time_budget
         self.max_iterations = max_iterations
         self.episodes_per_iter = episodes_per_iter
         self.ppo_epochs = ppo_epochs
         self.anneal_time_budget = anneal_time_budget
+        self.polish = polish
         self.checkpoint_path = checkpoint_path or DEFAULT_CHECKPOINT
 
     def _load_checkpoint(self) -> Optional[ActorCritic]:
         if os.path.exists(self.checkpoint_path):
             net = ActorCritic()
-            net.load_state_dict(torch.load(self.checkpoint_path, map_location="cpu"))
+            load_state(net, self.checkpoint_path)
             if self.verbose:
                 print(f"  loaded checkpoint: {self.checkpoint_path}")
             return net
@@ -118,11 +131,21 @@ class MyOptimizer(FloorplanOptimizer):
             episodes_per_iter=self.episodes_per_iter,
             ppo_epochs=self.ppo_epochs,
             verbose=self.verbose,
+            utilizations=utilization_ladder(self.checkpoint_path),
         )
         if self.anneal_time_budget > 0:
-            positions = anneal_polish(
-                instance, positions,
-                time_budget=self.anneal_time_budget,
-                verbose=self.verbose,
-            )
+            # Re-packing polish (rl/repack.py) replaced anneal_polish 09-26:
+            # 100 val cases, same RL layouts, 8s: cost 1.644 vs 1.690.
+            if self.polish == "anneal":
+                positions = anneal_polish(instance, positions,
+                                          time_budget=self.anneal_time_budget, verbose=self.verbose)
+            elif self.polish == "slice+repack":
+                # Slicing re-pack (rl/slicing.py) first, 09-28: 100 cached
+                # layouts, 1 s polish: cost 1.626 (repack) -> 1.552.
+                half = self.anneal_time_budget / 2
+                positions = slicing_polish(instance, positions, time_budget=half, verbose=self.verbose)
+                positions = repack_polish(instance, positions, time_budget=half, verbose=self.verbose)
+            else:
+                positions = repack_polish(instance, positions,
+                                          time_budget=self.anneal_time_budget, verbose=self.verbose)
         return positions

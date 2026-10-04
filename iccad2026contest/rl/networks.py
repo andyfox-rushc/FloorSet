@@ -21,6 +21,28 @@ import torch.nn.functional as F
 from .encoder import NetlistEncoder
 
 NEG_INF = -1e9
+# Step features (see GridPlacementEnv.step_features): what is still to come.
+# Callers pass `progress` either as the plain progress value (features then
+# count as zero) or as [progress, *features]; the features sit at the END of
+# each head's first layer so older checkpoints migrate by appending zero
+# columns (scripts/migrate_checkpoint_step_features.py).
+NUM_STEP_FEATS = 6
+
+
+def _ctx1(progress):
+    """Unbatched: progress is a scalar or [1 + NUM_STEP_FEATS] -> [1 + NUM_STEP_FEATS]."""
+    v = progress.reshape(-1)
+    if v.numel() == 1:
+        v = torch.cat([v, torch.zeros(NUM_STEP_FEATS, dtype=v.dtype)])
+    return v
+
+
+def _ctxN(progresses):
+    """Batched: progresses is [N] or [N, 1 + NUM_STEP_FEATS] -> [N, 1 + NUM_STEP_FEATS]."""
+    if progresses.dim() == 1:
+        progresses = torch.cat([progresses.unsqueeze(-1),
+                                torch.zeros(progresses.shape[0], NUM_STEP_FEATS, dtype=progresses.dtype)], dim=-1)
+    return progresses
 
 
 def masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -35,12 +57,12 @@ class AspectHead(nn.Module):
     def __init__(self, hidden_dim: int, num_aspects: int):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 1, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, num_aspects),
         )
 
     def forward(self, block_embedding, global_embedding, progress):
-        x = torch.cat([block_embedding, global_embedding, progress.view(1)], dim=0)
+        x = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
         return self.mlp(x)
 
     def forward_batch(self, block_embeddings, global_embeddings, progresses):
@@ -49,7 +71,7 @@ class AspectHead(nn.Module):
         replace a per-transition Python loop (the dominant cost of a PPO
         update -- ~90% of iteration wall time measured directly, dwarfing
         rollout collection) with one batched matmul per epoch."""
-        x = torch.cat([block_embeddings, global_embeddings, progresses.unsqueeze(-1)], dim=-1)
+        x = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
         return self.mlp(x)
 
 
@@ -63,14 +85,14 @@ class PositionCNN(nn.Module):
 
     def __init__(self, hidden_dim: int, cnn_channels: int = 16, conv_width: int = 32):
         super().__init__()
-        self.embed_proj = nn.Linear(hidden_dim * 2 + 1, cnn_channels)
+        self.embed_proj = nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, cnn_channels)
         self.conv1 = nn.Conv2d(3 + cnn_channels, conv_width, 3, padding=1)
         self.conv2 = nn.Conv2d(conv_width, conv_width, 3, padding=1)
         self.conv3 = nn.Conv2d(conv_width, 1, 1)
 
     def forward(self, occupancy, cluster_grid, wiremask, block_embedding, global_embedding, progress):
         g = occupancy.shape[0]
-        ctx = torch.cat([block_embedding, global_embedding, progress.view(1)], dim=0)
+        ctx = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
         emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
         x = torch.stack([occupancy, cluster_grid, wiremask], dim=0)
         x = torch.cat([x, emb_map], dim=0).unsqueeze(0)
@@ -86,7 +108,7 @@ class PositionCNN(nn.Module):
         used batch size 1 (see ppo_update's per-transition loop this
         replaces)."""
         n, g, _ = occupancy.shape
-        ctx = torch.cat([block_embeddings, global_embeddings, progresses.unsqueeze(-1)], dim=-1)
+        ctx = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
         emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
         x = torch.stack([occupancy, cluster_grid, wiremask], dim=1)
         x = torch.cat([x, emb_map], dim=1)
@@ -114,18 +136,20 @@ class ScalarHead(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim + 2, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim + 2 + NUM_STEP_FEATS, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, global_embedding, progress, reward_so_far):
-        x = torch.cat([global_embedding, progress.view(1), reward_so_far.view(1)], dim=0)
+        c = _ctx1(progress)
+        x = torch.cat([global_embedding, c[:1], reward_so_far.view(1), c[1:]], dim=0)
         return self.mlp(x).squeeze(-1)
 
     def forward_batch(self, global_embeddings, progresses, rewards_so_far):
         """Batched form of forward: [N, hidden] embeddings + [N] progress/
         reward_so_far -> [N] scalars."""
-        x = torch.cat([global_embeddings, progresses.unsqueeze(-1), rewards_so_far.unsqueeze(-1)], dim=-1)
+        c = _ctxN(progresses)
+        x = torch.cat([global_embeddings, c[:, :1], rewards_so_far.unsqueeze(-1), c[:, 1:]], dim=-1)
         return self.mlp(x).squeeze(-1)
 
 
@@ -177,3 +201,20 @@ class ActorCritic(nn.Module):
 
     def reward_approx_batch(self, global_embeddings, progresses, rewards_so_far):
         return self.reward_approx_head.forward_batch(global_embeddings, progresses, rewards_so_far)
+
+
+_STEP_FEAT_KEYS = ("aspect_head.mlp.0.weight", "position_cnn.embed_proj.weight",
+                   "value_head.mlp.0.weight", "reward_approx_head.mlp.0.weight")
+
+
+def load_state(net: nn.Module, path: str) -> nn.Module:
+    """load_state_dict from `path`, first appending zero step-feature input
+    columns to checkpoints saved before NUM_STEP_FEATS existed (same as
+    scripts/migrate_checkpoint_step_features.py; behaviour unchanged)."""
+    sd = torch.load(path, map_location="cpu")
+    target = net.state_dict()
+    for k in _STEP_FEAT_KEYS:
+        if k in sd and sd[k].shape[1] + NUM_STEP_FEATS == target[k].shape[1]:
+            sd[k] = torch.cat([sd[k], torch.zeros(sd[k].shape[0], NUM_STEP_FEATS)], dim=1)
+    net.load_state_dict(sd)
+    return net

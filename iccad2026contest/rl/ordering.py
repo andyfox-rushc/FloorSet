@@ -41,6 +41,7 @@ Reinforcement Learning", section on macro ordering):
        logic more same-cluster neighbors to actually touch against.
 """
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -58,6 +59,16 @@ _CLUSTER_BONUS = 1e6
 # both apply) -- see _boundary_priority and its use in
 # _order_units_by_connectivity.
 _BOUNDARY_BONUS = 1e3
+
+# Big-first (10-02, prototype): units in the top BIG_FRAC by area are seeded
+# with BIG_WEIGHT * _BOUNDARY_BONUS, so late big blocks don't force the live
+# frame to grow. BIG_FRAC = 0 = off.
+BIG_FRAC = float(os.environ.get("FLOORSET_BIG_FRAC", "0"))
+BIG_WEIGHT = float(os.environ.get("FLOORSET_BIG_WEIGHT", "3"))
+# "seed": big units are candidates from the start; "connected": a big unit
+# gets the bonus only once something it's wired to has been placed;
+# "scale": a big unit's connectivity counts BIG_WEIGHT times (no flat bonus).
+BIG_MODE = os.environ.get("FLOORSET_BIG_MODE", "seed")
 
 
 def _boundary_priority(unit: List[int], boundary_id: torch.Tensor) -> int:
@@ -146,6 +157,15 @@ def _order_units_by_connectivity(
         u_idx: _boundary_priority(units[u_idx], boundary_id) * _BOUNDARY_BONUS
         for u_idx in range(n_units)
     }
+    big = set()
+    if BIG_FRAC > 0:
+        unit_area = [sum(float(area_targets[m]) for m in u) for u in units]
+        k = max(1, round(BIG_FRAC * n_units))
+        big = set(sorted(range(n_units), key=lambda u: -unit_area[u])[:k])
+        if BIG_MODE == "seed":
+            for u_idx in big:
+                frontier_score[u_idx] += BIG_WEIGHT * _BOUNDARY_BONUS
+            big = set()
     frontier_score = {u: s for u, s in frontier_score.items() if s > 0.0}
     order_idxs: List[int] = []
 
@@ -162,7 +182,12 @@ def _order_units_by_connectivity(
             key = (next_u, v) if next_u < v else (v, next_u)
             w = unit_adj.get(key)
             if w:
+                if v in big and BIG_MODE == "scale":
+                    w *= BIG_WEIGHT
                 frontier_score[v] = frontier_score.get(v, 0.0) + w
+                if v in big and BIG_MODE == "connected":   # first wired neighbour placed
+                    frontier_score[v] += BIG_WEIGHT * _BOUNDARY_BONUS
+                    big.discard(v)
 
     return [units[u] for u in order_idxs]
 

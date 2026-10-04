@@ -34,3 +34,15 @@ def test_greedy_fallback_still_succeeds_at_default_padding():
     positions = finetune_mod.greedy_fallback_positions(instance, grid_dim=32)
     assert len(positions) == 10
     assert check_overlap(positions) == 0
+
+
+def test_reference_metrics_are_positive_and_caller_instance_is_untouched():
+    instance = synthetic_instance(area_targets=[4.0] * 6,
+                                   b2b_edges=[(i, i + 1, 1.0) for i in range(5)])
+    ref = finetune_mod.compute_reference_metrics(instance, grid_dim=16)
+    assert ref is not None and ref['hpwl_ref'] > 0 and ref['area_ref'] > 0
+
+    positions, _ = finetune_mod.finetune_and_solve(instance, time_budget=2.0, max_iterations=2,
+                                                    episodes_per_iter=2, ppo_epochs=1, seed=0)
+    assert instance.reference_metrics is None
+    assert check_overlap(positions) == 0

@@ -27,6 +27,9 @@ class FloorplanInstance:
     constraints: torch.Tensor         # [n, 5] (fixed, preplaced, mib_id, cluster_id, boundary_code)
     target_positions: torch.Tensor    # [n, 4] (x, y, w, h), -1 where free
     baseline_metrics: Optional[Dict[str, float]] = None  # {'hpwl_baseline', 'area_baseline'} or None
+    # {'hpwl_ref', 'area_ref'} from a fixed, policy-independent layout (see
+    # rl/finetune.py's compute_reference_metrics); normalizes inference_reward.
+    reference_metrics: Optional[Dict[str, float]] = None
 
 
 def from_validation_sample(evaluator: ContestEvaluator, idx: int) -> FloorplanInstance:

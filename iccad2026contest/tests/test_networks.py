@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from rl.data import synthetic_instance
@@ -85,3 +86,29 @@ def test_value_and_reward_approx_are_scalars():
     r = net.reward_approx(global_emb, torch.tensor(0.3), torch.tensor(-0.5))
     assert v.shape == ()
     assert r.shape == ()
+
+
+def test_step_features_shape_and_range():
+    from rl.data import synthetic_instance
+    from rl.env import GridPlacementEnv
+    from rl.networks import NUM_STEP_FEATS
+    inst = synthetic_instance(area_targets=[4.0, 9.0, 6.0])
+    env = GridPlacementEnv(inst, grid_dim=16, fine_factor=4)
+    f = env.step_features()
+    assert f.shape == (NUM_STEP_FEATS,)
+    assert torch.isfinite(f).all() and (f >= 0).all()
+    assert f[5] == pytest.approx(2 / 3)          # two of three steps still to come
+
+
+def test_old_checkpoint_loads_and_ignores_features(tmp_path):
+    from rl.networks import NUM_STEP_FEATS, _STEP_FEAT_KEYS, load_state
+    net = ActorCritic(hidden_dim=64)
+    sd = net.state_dict()
+    old = {k: (v[:, :-NUM_STEP_FEATS] if k in _STEP_FEAT_KEYS else v) for k, v in sd.items()}
+    path = tmp_path / "old.pt"
+    torch.save(old, path)
+    new = load_state(ActorCritic(hidden_dim=64), str(path))
+    be, ge = torch.randn(64), torch.randn(64)
+    plain = torch.tensor(0.4)
+    with_feats = torch.cat([torch.tensor([0.4]), torch.rand(NUM_STEP_FEATS)])
+    assert torch.allclose(new.aspect_head(be, ge, plain), new.aspect_head(be, ge, with_feats))

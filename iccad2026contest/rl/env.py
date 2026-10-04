@@ -57,6 +57,7 @@ Guarantees:
 """
 
 import math
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -133,10 +134,44 @@ ASPECT_RATIOS = [0.2, 0.3, 0.45, 0.67, 1.0, 1.5, 2.22, 3.33, 5.0]
 # ground-truth area, backing out its sqrt(total_area) formula against this
 # dataset's real ~0.97 utilization), a useful cross-check that this number
 # is real and not an artifact of one particular estimation method.
-UTILIZATION_TARGET = 0.5
+# 2026-09-25: raised to 0.6 together with DEFAULT_FINE_FACTOR=4 + the policy
+# aspect mask (scripts/canvas_scan.py, 100 val cases, untrained checkpoint):
+# U=0.6 still finishes 96% of sampled rollouts (0.65: 70%, 0.7: 24%) and cuts
+# compacted greedy cost 2.16 -> 1.98 vs the old U=0.5 coarse-grid setup.
+UTILIZATION_TARGET = 0.6
 # Below this many valid (non-sentinel) pins, the bounding box they'd give
 # is too small a sample to trust -- fall back to the old formula instead.
 MIN_VALID_PINS = 2
+# Anchor right/top-pinned blocks to the pin box ("die") instead of the
+# canvas edge, and prefer positions inside it; the canvas beyond the die is
+# overflow space only. Fine-grid path only (see _position_mask_fine).
+DEFAULT_DIE_ANCHOR = False
+# shape_fit: after the policy picks a cell, a free block's exact w/h (same
+# area) is adjusted within FIT_BAND of the chosen shape so it ends flush with
+# neighbours/gaps. lookahead: reject a cell if the next k largest unplaced
+# blocks would no longer fit anywhere (see lookahead_ok). Fine grid only.
+# edge_last: place edge-pinned blocks after the interior, against the interior's
+# bounding box instead of the canvas edges (see _set_edge_frame). Prototype.
+DEFAULT_EDGE_LAST = os.environ.get("FLOORSET_EDGE_LAST", "0") != "0"   # 09-29 retrain arm
+# known_dims: the ground-truth bbox starts at (0, 0), so a right-pinned
+# preplaced block's right edge is the true width (top-pinned: height). Use it
+# as the canvas width (height then from area / utilization); if only the
+# height is known, likewise. See _known_dims.
+DEFAULT_KNOWN_DIMS = os.environ.get("FLOORSET_KNOWN_DIMS", "0") != "0"   # off until validated
+# frame_util: live frame (prototype, 09-30). Placement starts inside an
+# origin-anchored frame sized for this tighter utilization, nested in the
+# normal canvas; the frame grows by FRAME_GROW (area) only when the current
+# block fits nowhere inside it. None = off. Fine grid only; see _set_frame.
+_FRAME_ENV = os.environ.get("FLOORSET_FRAME_UTIL", "")
+DEFAULT_FRAME_UTIL = float(_FRAME_ENV) if _FRAME_ENV else None
+FRAME_GROW = float(os.environ.get("FLOORSET_FRAME_GROW", "1.05"))
+FRAME_SLIDE = os.environ.get("FLOORSET_FRAME_SLIDE", "1") != "0"   # see _slide_pinned_out
+DEFAULT_SHAPE_FIT = True  # unpinned free blocks only; 09-26 scan: more finishes, same cost
+DEFAULT_LOOKAHEAD = 3  # 09-26 scan: more rollouts finish at every canvas size, same cost
+FIT_BAND = 1.4
+# Occupancy resolution multiplier over the action grid (see __init__). 4
+# removes most whole-cell rounding waste; 8 was ~4x slower for no cost gain.
+DEFAULT_FINE_FACTOR = 4
 
 
 def _rect_overlap(a, b) -> bool:
@@ -147,13 +182,46 @@ def _rect_overlap(a, b) -> bool:
     return ox > 1e-9 and oy > 1e-9
 
 
+def _rect_touch(a, b, eps=1e-6) -> bool:
+    """True if a and b share a boundary segment of positive length."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ox = min(ax + aw, bx + bw) - max(ax, bx)
+    oy = min(ay + ah, by + bh) - max(ay, by)
+    return (abs(ox) <= eps and oy > eps) or (abs(oy) <= eps and ox > eps)
+
+
 class GridPlacementEnv:
     def __init__(self, instance: FloorplanInstance, grid_dim: int = DEFAULT_GRID_DIM,
                  aspect_ratios: List[float] = ASPECT_RATIOS,
-                 canvas_padding: Optional[Union[float, Tuple[float, float]]] = None):
+                 canvas_padding: Optional[Union[float, Tuple[float, float]]] = None,
+                 pin_canvas: bool = False, fine_factor: Optional[int] = None,
+                 utilization: Optional[float] = None, die_anchor: Optional[bool] = None,
+                 shape_fit: Optional[bool] = None, lookahead: Optional[int] = None,
+                 edge_last: Optional[bool] = None, known_dims: Optional[bool] = None,
+                 frame_util: Optional[float] = None):
         self.instance = instance
         self.grid_dim = grid_dim
         self.aspect_ratios = aspect_ratios
+        # Prototype options (defaults keep the trained behavior): pin_canvas
+        # makes the canvas exactly the pin box; fine_factor > 1 tracks
+        # occupancy on a (grid_dim*fine_factor)^2 grid so blocks aren't
+        # rounded up to whole coarse cells -- see _position_mask_fine.
+        self.pin_canvas = pin_canvas
+        self.fine_factor = max(1, int(DEFAULT_FINE_FACTOR if fine_factor is None else fine_factor))
+        self.utilization = UTILIZATION_TARGET if utilization is None else utilization
+        self.die_anchor = DEFAULT_DIE_ANCHOR if die_anchor is None else die_anchor
+        self.shape_fit = DEFAULT_SHAPE_FIT if shape_fit is None else shape_fit
+        self.edge_last = DEFAULT_EDGE_LAST if edge_last is None else edge_last
+        self.known_dims = DEFAULT_KNOWN_DIMS if known_dims is None else known_dims
+        self.lookahead = DEFAULT_LOOKAHEAD if lookahead is None else int(lookahead)
+        self.frame_util = DEFAULT_FRAME_UTIL if frame_util is None else frame_util
+        if self.frame_util is not None and (self.frame_util <= self.utilization
+                                            or self.die_anchor or self.edge_last):
+            self.frame_util = None   # no tighter than the canvas, or anchors owned elsewhere
+        if self.fine_factor == 1:
+            self.shape_fit, self.lookahead, self.edge_last = False, 0, False
+            self.frame_util = None
         # An explicit override skips the pins-based sizing below entirely
         # (see reset()) and forces the old sqrt(total_area)*padding formula
         # -- used by rl/finetune.py's greedy_fallback_positions to widen the
@@ -171,7 +239,31 @@ class GridPlacementEnv:
                                    instance.b2b_connectivity)
         self.reset()
 
+    @staticmethod
+    def _known_dims(inst: FloorplanInstance) -> Tuple[Optional[float], Optional[float]]:
+        """(width, height) revealed by right/top-pinned preplaced blocks, or None."""
+        c = inst.constraints
+        if c.dim() < 2 or c.shape[1] < 5:
+            return None, None
+        pre = c[:, 1] != 0
+        code = c[:, 4].long()
+        tp = inst.target_positions
+        right = [float(tp[i, 0] + tp[i, 2]) for i in range(inst.block_count) if pre[i] and code[i] & 2]
+        top = [float(tp[i, 1] + tp[i, 3]) for i in range(inst.block_count) if pre[i] and code[i] & 4]
+        return (max(right) if right else None), (max(top) if top else None)
+
     def _estimate_canvas_size(self, inst: FloorplanInstance) -> Tuple[float, float]:
+        if not self._explicit_padding and self.known_dims:
+            kw, kh = self._known_dims(inst)
+            area = max(float(inst.area_targets.clamp(min=0).sum().item()), 1.0) / self.utilization
+            # Width wins when both are known: both exact would be ~97% full.
+            if kw and kw > 0:
+                return kw, area / kw
+            if kh and kh > 0:
+                return area / kh, kh
+        return self._estimate_canvas_size_pins(inst)
+
+    def _estimate_canvas_size_pins(self, inst: FloorplanInstance) -> Tuple[float, float]:
         """The working canvas's width/height, before any block is placed.
 
         Primary method: SHAPE from the instance's own pins (`pins_pos`,
@@ -197,12 +289,18 @@ class GridPlacementEnv:
             pins = inst.pins_pos
             if pins is not None and pins.numel() > 0:
                 valid = pins[(pins[:, 0] != -1) | (pins[:, 1] != -1)]
+                if self.pin_canvas and valid.shape[0] >= MIN_VALID_PINS:
+                    # Die = origin-anchored box covering the pins' max x/y.
+                    die_w = float(valid[:, 0].max().item())
+                    die_h = float(valid[:, 1].max().item())
+                    if die_w > 0 and die_h > 0:
+                        return die_w, die_h
                 if valid.shape[0] >= MIN_VALID_PINS:
                     pin_w = float((valid[:, 0].max() - valid[:, 0].min()).item())
                     pin_h = float((valid[:, 1].max() - valid[:, 1].min()).item())
                     if pin_w > 0 and pin_h > 0:
                         total_block_area = float(inst.area_targets.clamp(min=0).sum().item())
-                        canvas_area = max(total_block_area, 1.0) / UTILIZATION_TARGET
+                        canvas_area = max(total_block_area, 1.0) / self.utilization
                         ratio = pin_w / pin_h
                         est_width = math.sqrt(canvas_area * ratio)
                         est_height = canvas_area / est_width
@@ -245,7 +343,39 @@ class GridPlacementEnv:
         self.cell_w = (self.x_max - self.x_min) / self.grid_dim
         self.cell_h = (self.y_max - self.y_min) / self.grid_dim
 
+        # Edges right/top-pinned blocks anchor to: the canvas edge, or with
+        # die_anchor the pin box's max x/y (clamped inside the canvas, and
+        # never left of a preplaced block's far edge).
+        self.anchor_x_max, self.anchor_y_max = self.x_max, self.y_max
+        self.anchor_x_min, self.anchor_y_min = self.x_min, self.y_min
+        self._frame_set = False
+        if self.die_anchor and self.fine_factor > 1:
+            pins = inst.pins_pos
+            if pins is not None and pins.numel() > 0:
+                valid = pins[(pins[:, 0] != -1) | (pins[:, 1] != -1)]
+                if valid.shape[0] >= MIN_VALID_PINS:
+                    die_w = float(valid[:, 0].max().item())
+                    die_h = float(valid[:, 1].max().item())
+                    if die_w > self.x_min and die_h > self.y_min:
+                        self.anchor_x_max = min(self.x_max, max([die_w] + xs1))
+                        self.anchor_y_max = min(self.y_max, max([die_h] + ys1))
+
         self.occupancy = torch.zeros(self.grid_dim, self.grid_dim)
+        if self.fine_factor > 1:
+            self.fine_dim = self.grid_dim * self.fine_factor
+            self.fine_cell_w = self.cell_w / self.fine_factor
+            self.fine_cell_h = self.cell_h / self.fine_factor
+            self.fine_occ = torch.zeros(self.fine_dim, self.fine_dim)
+            self._sat_cache = None
+            self.fine_cluster: Dict[int, torch.Tensor] = {}
+            self._fine_choice: Optional[torch.Tensor] = None
+        self.frame_growths = 0
+        if self.frame_util is not None:
+            # Real block occupancy; fine_occ = this OR the cells outside the frame.
+            self._real_occ = torch.zeros(self.fine_dim, self.fine_dim)
+            s = math.sqrt(self.utilization / self.frame_util)
+            self._set_frame(max([self.x_min + (self.x_max - self.x_min) * s] + xs1),
+                            max([self.y_min + (self.y_max - self.y_min) * s] + ys1))
         self.positions: List[Optional[Tuple[float, float, float, float]]] = [None] * n
         self.mib_shape: Dict[int, Tuple[float, float]] = {}
         self.cluster_cells: Dict[int, set] = defaultdict(set)
@@ -289,6 +419,8 @@ class GridPlacementEnv:
                 self._grow_bbox(x, y, w, h)
 
         self._pending = [s for s in self.plan.order if s.role != 'preplaced']
+        if self.edge_last:
+            self._pending = self._edge_last_order(self._pending)
         self._cursor = 0
         self._pending_shape: Optional[Tuple[float, float]] = None
         return None
@@ -315,16 +447,143 @@ class GridPlacementEnv:
         gy1 = max(gy0, min(gy1, self.grid_dim))
         return gx0, gy0, gx1, gy1
 
+    def _fine_rect_to_cells(self, x, y, w, h):
+        """_rect_to_cells on the fine grid (same epsilon reasoning)."""
+        d = self.fine_dim
+        fx0 = int(math.floor((x - self.x_min) / self.fine_cell_w + 1e-9))
+        fy0 = int(math.floor((y - self.y_min) / self.fine_cell_h + 1e-9))
+        fx1 = int(math.ceil((x + w - self.x_min) / self.fine_cell_w - 1e-9))
+        fy1 = int(math.ceil((y + h - self.y_min) / self.fine_cell_h - 1e-9))
+        fx0, fy0 = max(0, min(fx0, d)), max(0, min(fy0, d))
+        return fx0, fy0, max(fx0, min(fx1, d)), max(fy0, min(fy1, d))
+
     def _mark_occupied(self, x, y, w, h):
+        if self.fine_factor > 1:
+            # Observation = fraction of each coarse cell that's occupied.
+            fx0, fy0, fx1, fy1 = self._fine_rect_to_cells(x, y, w, h)
+            self.fine_occ[fy0:fy1, fx0:fx1] = 1.0
+            if self.frame_util is not None:
+                self._real_occ[fy0:fy1, fx0:fx1] = 1.0
+            self._sat_cache = None
+            self.occupancy = F.avg_pool2d(self.fine_occ[None, None], self.fine_factor)[0, 0]
+            return
         gx0, gy0, gx1, gy1 = self._rect_to_cells(x, y, w, h)
         if gx1 > gx0 and gy1 > gy0:
             self.occupancy[gy0:gy1, gx0:gx1] = 1.0
 
     def _mark_cluster(self, cid, x, y, w, h):
+        if self.fine_factor > 1:
+            fx0, fy0, fx1, fy1 = self._fine_rect_to_cells(x, y, w, h)
+            if cid not in self.fine_cluster:
+                self.fine_cluster[cid] = torch.zeros(self.fine_dim, self.fine_dim)
+            self.fine_cluster[cid][fy0:fy1, fx0:fx1] = 1.0
         gx0, gy0, gx1, gy1 = self._rect_to_cells(x, y, w, h)
         for gy in range(gy0, gy1):
             for gx in range(gx0, gx1):
                 self.cluster_cells[cid].add((gy, gx))
+
+    # -- live frame (frame_util) --------------------------------------------
+    def _set_frame(self, x1, y1):
+        """Frame = [x_min, x1] x [y_min, y1], snapped outward to whole fine
+        cells so right/top anchors sit on a fine grid line."""
+        cols = min(self.fine_dim, max(1, math.ceil((x1 - self.x_min) / self.fine_cell_w - 1e-9)))
+        rows = min(self.fine_dim, max(1, math.ceil((y1 - self.y_min) / self.fine_cell_h - 1e-9)))
+        self._set_frame_cells(rows, cols)
+
+    def _set_frame_cells(self, rows, cols):
+        d = self.fine_dim
+        self._frame_cells = (rows, cols)
+        # Right/top-pinned blocks anchor to the frame edge.
+        self.anchor_x_max = self.x_max if cols == d else self.x_min + cols * self.fine_cell_w
+        self.anchor_y_max = self.y_max if rows == d else self.y_min + rows * self.fine_cell_h
+        outside = torch.ones(d, d)
+        outside[:rows, :cols] = 0.0
+        self.fine_occ = torch.maximum(self._real_occ, outside)
+        self._sat_cache = None
+        self.occupancy = F.avg_pool2d(self.fine_occ[None, None], self.fine_factor)[0, 0]
+
+    def _grow_frame(self) -> bool:
+        """Grow the frame's area by FRAME_GROW (at least one fine cell per
+        side), capped at the canvas. False when it already is the canvas."""
+        d = self.fine_dim
+        rows, cols = self._frame_cells
+        if rows == d and cols == d:
+            return False
+        g = math.sqrt(FRAME_GROW)
+        old_x1, old_y1 = self.anchor_x_max, self.anchor_y_max
+        self._set_frame_cells(min(d, max(rows + 1, math.ceil(rows * g))),
+                              min(d, max(cols + 1, math.ceil(cols * g))))
+        self.frame_growths += 1
+        if FRAME_SLIDE:
+            self._slide_pinned_out(old_x1, old_y1)
+        return True
+
+    def _slide_pinned_out(self, old_x1, old_y1):
+        """Right/top-pinned blocks flush with the old frame edge follow it to
+        the new edge when the swept path is clear, so growth doesn't strand
+        them. Occupancy and cluster maps are rebuilt if anything moved."""
+        c = self.instance.constraints
+        if c.dim() < 2 or c.shape[1] < 5:
+            return
+        pre = c[:, 1] != 0
+        codes = c[:, 4].long()
+        eps = 1e-6
+        moved = False
+        for i, p in enumerate(self.positions):
+            if p is None or bool(pre[i]):
+                continue
+            code = int(codes[i])
+            x, y, w, h = p
+            nx, ny = x, y
+            if code & 2 and abs(x + w - old_x1) < eps:
+                nx = self.anchor_x_max - w
+            if code & 4 and abs(y + h - old_y1) < eps:
+                ny = self.anchor_y_max - h
+            if nx == x and ny == y:
+                continue
+            # Swept rectangle from the old to the new position.
+            swept = (x, y, nx + w - x, ny + h - y)
+            if any(j != i and q is not None and _rect_overlap(swept, q)
+                   for j, q in enumerate(self.positions)):
+                continue
+            # A clustered block must still touch a placed clustermate.
+            cid = int(c[i, 3]) if c.shape[1] > 3 else 0
+            mates = [q for j, q in enumerate(self.positions)
+                     if cid and j != i and q is not None and int(c[j, 3]) == cid]
+            if mates and not any(_rect_touch((nx, ny, w, h), q) for q in mates):
+                continue
+            self.positions[i] = (nx, ny, w, h)
+            moved = True
+        if moved:
+            self._rebuild_maps()
+
+    def _rebuild_maps(self):
+        """Recompute real occupancy and cluster maps from self.positions."""
+        c = self.instance.constraints
+        cluster_col = c[:, 3].long() if c.dim() > 1 and c.shape[1] > 3 else None
+        self._real_occ.zero_()
+        self.fine_cluster = {}
+        self.cluster_cells = defaultdict(set)
+        for i, p in enumerate(self.positions):
+            if p is None:
+                continue
+            fx0, fy0, fx1, fy1 = self._fine_rect_to_cells(*p)
+            self._real_occ[fy0:fy1, fx0:fx1] = 1.0
+            cid = int(cluster_col[i]) if cluster_col is not None else 0
+            if cid:
+                self._mark_cluster(cid, *p)
+        self._set_frame_cells(*self._frame_cells)
+        if self._bbox is not None:
+            for p in self.positions:
+                if p is not None:
+                    self._grow_bbox(*p)
+
+    def _grow_frame_until(self, fits) -> None:
+        """Grow the frame until `fits()` or it reaches the canvas."""
+        if self.frame_util is None:
+            return
+        while not fits() and self._grow_frame():
+            pass
 
     def _grow_bbox(self, x, y, w, h) -> float:
         """Extends the running placed-content bbox to include (x,y,w,h);
@@ -385,6 +644,39 @@ class GridPlacementEnv:
             return math.sqrt(own_area * aspect), math.sqrt(own_area / aspect)
         raise ValueError(f"current_shape() called for role={step.role}; call choose_aspect() first")
 
+    def aspect_mask(self) -> torch.Tensor:
+        """Bool [len(aspect_ratios)]: True where the current free block, at
+        that aspect ratio, has at least one legal position right now. Lets
+        a caller avoid picking a shape that can't fit anywhere (all False
+        means the block can't be placed in any shape). With a live frame,
+        grows it first until at least one shape fits."""
+        if self.frame_util is not None:
+            out = None
+
+            def fits():
+                nonlocal out
+                out = self._aspect_mask_now()
+                return bool(out.any())
+            self._grow_frame_until(fits)
+            return out
+        return self._aspect_mask_now()
+
+    def _aspect_mask_now(self) -> torch.Tensor:
+        area = self.current_area()
+        out = torch.zeros(len(self.aspect_ratios), dtype=torch.bool)
+        for a, r in enumerate(self.aspect_ratios):
+            w, h = math.sqrt(area * r), math.sqrt(area / r)
+            if self.fine_factor > 1:
+                fw = max(1, math.ceil(w / self.fine_cell_w - 1e-9))
+                fh = max(1, math.ceil(h / self.fine_cell_h - 1e-9))
+                if fw <= self.fine_dim and fh <= self.fine_dim:
+                    out[a] = bool(self._free_map(fw, fh).any())
+            else:
+                cells_w, cells_h = self._footprint_cells(w, h)
+                window = F.conv2d(self.occupancy[None, None], torch.ones(1, 1, cells_h, cells_w))[0, 0]
+                out[a] = bool((window == 0).any())
+        return out
+
     def choose_aspect(self, aspect_idx: int) -> Tuple[float, float]:
         step = self.current_step()
         assert step.role == 'free', f"choose_aspect() invalid for role={step.role}"
@@ -413,6 +705,9 @@ class GridPlacementEnv:
                 x, y = touch
                 self._commit(x, y, w, h)
                 return None
+
+        if self.fine_factor > 1:
+            return self._position_mask_fine(w, h, step)
 
         cells_w, cells_h = self._footprint_cells(w, h)
         occ = self.occupancy.unsqueeze(0).unsqueeze(0)
@@ -450,6 +745,220 @@ class GridPlacementEnv:
         if bool(compact.any()):
             return compact, cells_w, cells_h
         return free, cells_w, cells_h
+
+    # -- fine-grid legality (fine_factor > 1) ------------------------------
+    @staticmethod
+    def _sat(grid):
+        """Summed-area table of a 0/1 grid, zero-padded on the top/left."""
+        return F.pad(grid.to(torch.int32).cumsum(0).cumsum(1), (1, 0, 1, 0))
+
+    def _window_sums(self, grid, fw, fh, sat=None):
+        """Sum of `grid` over every fw x fh window, indexed by top-left
+        fine cell -- shape [dim-fh+1, dim-fw+1], via a summed-area table.
+        Pass a precomputed `sat` to skip rebuilding it."""
+        if sat is None:
+            sat = self._sat(grid)
+        d = sat.shape[0] - 1
+        return (sat[fh:, fw:] - sat[:d - fh + 1, fw:]
+                - sat[fh:, :d - fw + 1] + sat[:d - fh + 1, :d - fw + 1])
+
+    def _occ_sats(self):
+        """(SAT of fine_occ, SAT of its 3x3 dilation), cached until the
+        next _mark_occupied -- aspect_mask and position_mask reuse them."""
+        if self._sat_cache is None:
+            dil = F.max_pool2d(self.fine_occ[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+            self._sat_cache = (self._sat(self.fine_occ), self._sat(dil))
+        return self._sat_cache
+
+    def _free_map(self, fw, fh):
+        return self._window_sums(self.fine_occ, fw, fh, sat=self._occ_sats()[0]) == 0
+
+    def _touch_map(self, grid, fw, fh, sat=None):
+        """True where a fw x fh footprint would touch or overlap `grid`."""
+        if sat is None:
+            dil = F.max_pool2d(grid[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+            sat = self._sat(dil)
+        return self._window_sums(grid, fw, fh, sat=sat) > 0
+
+    def _to_coarse(self, fine_map):
+        """Pads a fine top-left map to [fine_dim]^2 and marks each coarse
+        cell containing at least one legal fine position."""
+        d, k, g = self.fine_dim, self.fine_factor, self.grid_dim
+        full = torch.zeros(d, d, dtype=torch.bool)
+        full[:fine_map.shape[0], :fine_map.shape[1]] = fine_map
+        self._fine_choice = full
+        return full.view(g, k, g, k).any(dim=3).any(dim=1)
+
+    def _position_mask_fine(self, w, h, step):
+        """position_mask() for fine_factor > 1. Legality is decided on the
+        fine grid; the returned mask is over coarse cells (the action
+        space), and place() picks the legal fine position nearest the
+        chosen cell's corner. Same preference order as the coarse path:
+        boundary edge, then cluster adjacency, then compactness."""
+        d = self.fine_dim
+        fw = max(1, math.ceil(w / self.fine_cell_w - 1e-9))
+        fh = max(1, math.ceil(h / self.fine_cell_h - 1e-9))
+        cells_w, cells_h = self._footprint_cells(w, h)
+        if fw > d or fh > d:
+            raise RuntimeError(
+                f"No free position for block {step.block_idx} (w={w}, h={h}); "
+                f"block larger than canvas.")
+        self._grow_frame_until(lambda: bool(self._free_map(fw, fh).any()))
+        free = self._free_map(fw, fh)
+        if not bool(free.any()):
+            raise RuntimeError(
+                f"No free position for block {step.block_idx} (w={w}, h={h}); "
+                f"canvas too small -- increase CANVAS_PADDING or grid_dim.")
+
+        code = step.boundary_code
+        if code:
+            if self.edge_last and not self._frame_set:
+                self._set_edge_frame()
+            pinned = self._pinned_window(code, w, h, fw, fh)
+            if not bool(pinned.any()) and self.edge_last and self._frame_set:
+                # No room flush inside the frame: widen the frame by this block
+                # on its pinned side(s) and sit just outside the old edge.
+                saved = (self.anchor_x_min, self.anchor_x_max, self.anchor_y_min, self.anchor_y_max)
+                if code & 1:
+                    self.anchor_x_min = max(self.x_min, self.anchor_x_min - w)
+                if code & 2:
+                    self.anchor_x_max = min(self.x_max, self.anchor_x_max + w)
+                if code & 8:
+                    self.anchor_y_min = max(self.y_min, self.anchor_y_min - h)
+                if code & 4:
+                    self.anchor_y_max = min(self.y_max, self.anchor_y_max + h)
+                pinned = self._pinned_window(code, w, h, fw, fh)
+                if not bool(pinned.any()):
+                    self.anchor_x_min, self.anchor_x_max, self.anchor_y_min, self.anchor_y_max = saved
+            if bool(pinned.any()):
+                self._boundary_pin_ok = True
+                return self._to_coarse(self._prefer_inside(pinned, fw, fh)), cells_w, cells_h
+            self.boundary_fallback_count += 1
+            return self._to_coarse(self._prefer_inside(free, fw, fh)), cells_w, cells_h
+
+        cid = step.cluster_id
+        if cid:
+            cgrid = self.fine_cluster.get(cid)
+            if cgrid is not None:
+                adj = self._touch_map(cgrid, fw, fh) & free
+                if bool(adj.any()):
+                    return self._to_coarse(self._prefer_inside(adj, fw, fh)), cells_w, cells_h
+                self.grouping_fallback_count += 1
+
+        compact = self._touch_map(self.fine_occ, fw, fh, sat=self._occ_sats()[1]) & free
+        if self.die_anchor:
+            # Inside the die beats touching: the slack is overflow only.
+            for cand in (compact, free):
+                inner = cand & self._inside_die(cand.shape, fw, fh)
+                if bool(inner.any()):
+                    return self._to_coarse(inner), cells_w, cells_h
+        if bool(compact.any()):
+            return self._to_coarse(compact), cells_w, cells_h
+        return self._to_coarse(free), cells_w, cells_h
+
+    def _pinned_window(self, code, w, h, fw, fh):
+        """Top-left fine cells where the block can sit flush with the anchor
+        edge(s) its code requires. The checked window runs from the fine
+        cell holding the snapped coordinate to the cell holding the anchor,
+        so snapping flush in place() stays inside verified free space."""
+        d = self.fine_dim
+        bw, bh, fx_pin, fy_pin = fw, fh, None, None
+        if code & 1:
+            fx_pin = int(math.floor((self.anchor_x_min - self.x_min) / self.fine_cell_w + 1e-9))
+            bw = max(fw, min(d, math.ceil((self.anchor_x_min + w - self.x_min) / self.fine_cell_w - 1e-9)) - fx_pin)
+        if code & 2:
+            fx_pin = max(0, int(math.floor((self.anchor_x_max - w - self.x_min) / self.fine_cell_w + 1e-9)))
+            bw = max(fw, self._die_fine_cols() - fx_pin)
+        if code & 8:
+            fy_pin = int(math.floor((self.anchor_y_min - self.y_min) / self.fine_cell_h + 1e-9))
+            bh = max(fh, min(d, math.ceil((self.anchor_y_min + h - self.y_min) / self.fine_cell_h - 1e-9)) - fy_pin)
+        if code & 4:
+            fy_pin = max(0, int(math.floor((self.anchor_y_max - h - self.y_min) / self.fine_cell_h + 1e-9)))
+            bh = max(fh, self._die_fine_rows() - fy_pin)
+        if bw > d or bh > d:
+            return torch.zeros(1, 1, dtype=torch.bool)
+        pinned = self._free_map(bw, bh)
+        keep = torch.zeros_like(pinned)
+        # A block wider/taller than its anchor span can't sit flush.
+        too_big = ((code & 2 and self.anchor_x_max - w < self.x_min - 1e-9)
+                   or (code & 4 and self.anchor_y_max - h < self.y_min - 1e-9)
+                   or (code & 1 and self.anchor_x_min + w > self.x_max + 1e-9)
+                   or (code & 8 and self.anchor_y_min + h > self.y_max + 1e-9))
+        if too_big:
+            return keep
+        if fx_pin is not None and fy_pin is not None:
+            if fy_pin < keep.shape[0] and fx_pin < keep.shape[1]:
+                keep[fy_pin, fx_pin] = True
+        elif fx_pin is not None:
+            if fx_pin < keep.shape[1]:
+                keep[:, fx_pin] = True
+        elif fy_pin is not None:
+            if fy_pin < keep.shape[0]:
+                keep[fy_pin, :] = True
+        return pinned & keep
+
+    def _set_edge_frame(self):
+        """edge_last: freeze the anchor edges at the bounding box of what is
+        placed so far (the interior), instead of the canvas edges."""
+        placed = [p for p in self.positions if p is not None]
+        if placed:
+            self.anchor_x_min = min(p[0] for p in placed)
+            self.anchor_y_min = min(p[1] for p in placed)
+            self.anchor_x_max = max(p[0] + p[2] for p in placed)
+            self.anchor_y_max = max(p[1] + p[3] for p in placed)
+        self._frame_set = True
+
+    @staticmethod
+    def _edge_last_order(pending):
+        """Stable reorder: units with no boundary pin first, then the rest.
+        A unit is an MIB leader plus its followers (kept contiguous so a
+        follower always comes after the shape it copies); it counts as
+        pinned if any member is."""
+        units = []
+        for st in pending:
+            if st.role == 'mib_follower' and units:
+                units[-1].append(st)
+            else:
+                units.append([st])
+        inner = [u for u in units if not any(st.boundary_code for st in u)]
+        edge = [u for u in units if any(st.boundary_code for st in u)]
+        return [st for u in inner + edge for st in u]
+
+    def _die_fine_cols(self):
+        return min(self.fine_dim, math.ceil((self.anchor_x_max - self.x_min) / self.fine_cell_w - 1e-9))
+
+    def _die_fine_rows(self):
+        return min(self.fine_dim, math.ceil((self.anchor_y_max - self.y_min) / self.fine_cell_h - 1e-9))
+
+    def _inside_die(self, shape, fw, fh):
+        """Bool map (top-left fine cells, `shape`) of footprints lying
+        entirely within the die."""
+        inside = torch.zeros(shape, dtype=torch.bool)
+        # floor: only fine cells lying wholly inside the die count.
+        die_r = int(math.floor((self.anchor_y_max - self.y_min) / self.fine_cell_h + 1e-9))
+        die_c = int(math.floor((self.anchor_x_max - self.x_min) / self.fine_cell_w + 1e-9))
+        rows, cols = die_r - fh + 1, die_c - fw + 1
+        if rows > 0 and cols > 0:
+            inside[:rows, :cols] = True
+        return inside
+
+    def _prefer_inside(self, cand, fw, fh):
+        """`cand` restricted to inside-die footprints when die_anchor is on
+        and any exist; otherwise `cand` unchanged."""
+        if not self.die_anchor:
+            return cand
+        inner = cand & self._inside_die(cand.shape, fw, fh)
+        return inner if bool(inner.any()) else cand
+
+    def _fine_position_in_cell(self, gy, gx):
+        """Legal fine top-left (fy, fx) inside coarse cell (gy, gx) nearest
+        its lower-left corner, from the last _position_mask_fine call."""
+        k = self.fine_factor
+        window = self._fine_choice[gy * k:(gy + 1) * k, gx * k:(gx + 1) * k]
+        idx = window.nonzero(as_tuple=False)
+        assert idx.numel() > 0, f"coarse cell ({gy}, {gx}) not in the position mask"
+        best = min(idx.tolist(), key=lambda t: (t[0] + t[1], t[0]))
+        return gy * k + best[0], gx * k + best[1]
 
     def _compactness_mask(self, free, cells_w, cells_h):
         dilated = F.max_pool2d(self.occupancy.unsqueeze(0).unsqueeze(0),
@@ -559,18 +1068,18 @@ class GridPlacementEnv:
         """True if x-coordinate `x` satisfies code's left(1)/right(2) bit,
         if any (assumes at most one is set -- see _try_cluster_touch)."""
         eps = 1e-6
-        if code & 1 and abs(x - self.x_min) > eps:
+        if code & 1 and abs(x - self.anchor_x_min) > eps:
             return False
-        if code & 2 and abs(x + w - self.x_max) > eps:
+        if code & 2 and abs(x + w - self.anchor_x_max) > eps:
             return False
         return True
 
     def _y_bit_satisfied(self, y, h, code) -> bool:
         """Mirror of _x_bit_satisfied for top(4)/bottom(8)."""
         eps = 1e-6
-        if code & 4 and abs(y + h - self.y_max) > eps:
+        if code & 4 and abs(y + h - self.anchor_y_max) > eps:
             return False
-        if code & 8 and abs(y - self.y_min) > eps:
+        if code & 8 and abs(y - self.anchor_y_min) > eps:
             return False
         return True
 
@@ -578,20 +1087,31 @@ class GridPlacementEnv:
         """The x-coordinate code's left/right bit forces, or None if
         neither bit is set (caller should search x freely instead)."""
         if code & 1:
-            return self.x_min
+            return self.anchor_x_min
         if code & 2:
-            return self.x_max - w
+            return self.anchor_x_max - w
         return None
 
     def _forced_y(self, h, code) -> Optional[float]:
         """Mirror of _forced_x for top/bottom."""
         if code & 4:
-            return self.y_max - h
+            return self.anchor_y_max - h
         if code & 8:
-            return self.y_min
+            return self.anchor_y_min
         return None
 
     def _try_cluster_touch(self, cid, w, h, code=0):
+        """Touch search, trying positions inside the die first when
+        die_anchor is on (see _try_cluster_touch_within)."""
+        if self.die_anchor:
+            hit = self._try_cluster_touch_within(cid, w, h, code, self.anchor_x_max, self.anchor_y_max)
+            if hit is not None:
+                return hit
+        if self.frame_util is not None:
+            return self._try_cluster_touch_within(cid, w, h, code, self.anchor_x_max, self.anchor_y_max)
+        return self._try_cluster_touch_within(cid, w, h, code, self.x_max, self.y_max)
+
+    def _try_cluster_touch_within(self, cid, w, h, code, lim_x, lim_y):
         """Exact geometric touch against an already-placed clustermate --
         see the module docstring's Grouping guarantee.
 
@@ -637,9 +1157,9 @@ class GridPlacementEnv:
         for (nx, ny, nw, nh) in neighbors:
             # Touch on the neighbor's left/right side: cx is fixed by the
             # touch itself, cy is otherwise free.
-            y_lo, y_hi = max(self.y_min, ny - h), min(self.y_max - h, ny + nh)
+            y_lo, y_hi = max(self.y_min, ny - h), min(lim_y - h, ny + nh)
             for cx in (nx + nw, nx - w):
-                if cx < self.x_min - 1e-9 or cx + w > self.x_max + 1e-9:
+                if cx < self.x_min - 1e-9 or cx + w > lim_x + 1e-9:
                     continue
                 if code and not self._x_bit_satisfied(cx, w, code):
                     continue
@@ -653,9 +1173,9 @@ class GridPlacementEnv:
                     if not any(p is not None and _rect_overlap(candidate, p) for p in self.positions):
                         return cx, cy
             # Touch on the neighbor's top/bottom side: cy is fixed, cx free.
-            x_lo, x_hi = max(self.x_min, nx - w), min(self.x_max - w, nx + nw)
+            x_lo, x_hi = max(self.x_min, nx - w), min(lim_x - w, nx + nw)
             for cy in (ny + nh, ny - h):
-                if cy < self.y_min - 1e-9 or cy + h > self.y_max + 1e-9:
+                if cy < self.y_min - 1e-9 or cy + h > lim_y + 1e-9:
                     continue
                 if code and not self._y_bit_satisfied(cy, h, code):
                     continue
@@ -711,14 +1231,24 @@ class GridPlacementEnv:
         return ncols > 2 and self.instance.constraints[i, 2] != 0
 
     def place(self, gy: int, gx: int):
+        self._commit(*self._resolve_placement(gy, gx))
+
+    def _resolve_placement(self, gy: int, gx: int):
+        """The exact (x, y, w, h) place(gy, gx) would commit, without
+        committing it."""
         step = self.current_step()
         if step.role == 'free':
             w, h = self._pending_shape
         else:
             w, h = self.current_shape()
 
-        x = self.x_min + gx * self.cell_w
-        y = self.y_min + gy * self.cell_h
+        if self.fine_factor > 1:
+            fy, fx = self._fine_position_in_cell(gy, gx)
+            x = self.x_min + fx * self.fine_cell_w
+            y = self.y_min + fy * self.fine_cell_h
+        else:
+            x = self.x_min + gx * self.cell_w
+            y = self.y_min + gy * self.cell_h
 
         code = step.boundary_code
         if code and self._boundary_pin_ok:
@@ -729,15 +1259,193 @@ class GridPlacementEnv:
             # free window (see env.py module docstring), never into
             # unverified space.
             if code & 1:
-                x = self.x_min
+                x = self.anchor_x_min
             if code & 2:
-                x = self.x_max - w
+                x = self.anchor_x_max - w
             if code & 4:
-                y = self.y_max - h
+                y = self.anchor_y_max - h
             if code & 8:
-                y = self.y_min
+                y = self.anchor_y_min
 
-        self._commit(x, y, w, h)
+        if self.shape_fit and step.role == 'free' and not step.boundary_code:
+            x, y, w, h = self._fit_shape(x, y, w, h, code if self._boundary_pin_ok else 0)
+        return x, y, w, h
+
+    # -- shape fitting and lookahead (fine grid only) ----------------------
+    def _fit_shape(self, x, y, w, h, code):
+        """Same-area reshape of a free block, within FIT_BAND of (w, h). Ranked
+        by: least growth of the placed layout's bbox, then most edge contact
+        with placed blocks and the canvas's left/bottom edges (closes gaps,
+        aligns edges), then closeness to the chosen shape. Ranking contact
+        first stretched blocks outward and grew the bbox (09-26 scan). The
+        corner on its pinned edges stays put (right/top pins keep their
+        right/top edge). Candidates are checked exactly against every placed
+        rect."""
+        area = w * h
+        right_fixed, top_fixed = bool(code & 2), bool(code & 4)
+        x_ref = x + w if right_fixed else x
+        y_ref = y + h if top_fixed else y
+        placed = [p for p in self.positions if p is not None]
+        xs = {self.x_min, self.x_max, self.anchor_x_max}
+        ys = {self.y_min, self.y_max, self.anchor_y_max}
+        for (px, py, pw, ph) in placed:
+            xs.update((px, px + pw))
+            ys.update((py, py + ph))
+        widths = {abs(e - x_ref) for e in xs}
+        heights = {abs(e - y_ref) for e in ys}
+        cands = {(w, h)}
+        cands.update((cw, area / cw) for cw in widths if w / FIT_BAND <= cw <= w * FIT_BAND)
+        cands.update((area / ch, ch) for ch in heights if h / FIT_BAND <= ch <= h * FIT_BAND)
+
+        if placed:
+            bx0 = min(p[0] for p in placed)
+            by0 = min(p[1] for p in placed)
+            bx1 = max(p[0] + p[2] for p in placed)
+            by1 = max(p[1] + p[3] for p in placed)
+        else:
+            bx0 = by0 = bx1 = by1 = None
+
+        def bbox_growth(r):
+            rx, ry, rw, rh = r
+            if bx0 is None:
+                return rw * rh
+            return ((max(bx1, rx + rw) - min(bx0, rx)) * (max(by1, ry + rh) - min(by0, ry))
+                    - (bx1 - bx0) * (by1 - by0))
+
+        best, best_key = (x, y, w, h), None
+        # A live frame bounds the reshape too (its outside is not real space).
+        lim_x, lim_y = ((self.anchor_x_max, self.anchor_y_max) if self.frame_util is not None
+                        else (self.x_max, self.y_max))
+        for cw, ch in cands:
+            cx = x_ref - cw if right_fixed else x_ref
+            cy = y_ref - ch if top_fixed else y_ref
+            if (cx < self.x_min - 1e-9 or cy < self.y_min - 1e-9
+                    or cx + cw > lim_x + 1e-9 or cy + ch > lim_y + 1e-9):
+                continue
+            rect = (cx, cy, cw, ch)
+            if any(_rect_overlap(rect, p) for p in placed):
+                continue
+            key = (-round(bbox_growth(rect), 6), round(self._contact(rect, placed), 9),
+                   -abs(math.log(cw / w)))
+            if best_key is None or key > best_key:
+                best, best_key = rect, key
+        return best
+
+    def _contact(self, rect, placed):
+        """Length of rect's boundary shared with placed rects or the
+        canvas's left/bottom edges."""
+        x, y, w, h = rect
+        eps = 1e-6
+        total = (h if abs(x - self.x_min) < eps else 0.0) + (w if abs(y - self.y_min) < eps else 0.0)
+        for (px, py, pw, ph) in placed:
+            if abs(px + pw - x) < eps or abs(x + w - px) < eps:
+                total += max(0.0, min(y + h, py + ph) - max(y, py))
+            if abs(py + ph - y) < eps or abs(y + h - py) < eps:
+                total += max(0.0, min(x + w, px + pw) - max(x, px))
+        return total
+
+    def _upcoming_shapes(self):
+        """Shape options for the `lookahead` largest unplaced blocks after
+        the current one: a single (w, h) for fixed blocks and followers
+        whose leader is placed, every aspect bucket otherwise."""
+        key = self._cursor
+        if getattr(self, '_upcoming_key', None) == key:
+            return self._upcoming_cache
+        rest = []
+        for st in self._pending[self._cursor + 1:]:
+            i = st.block_idx
+            area = float(self.instance.area_targets[i])
+            if st.role == 'fixed':
+                tp = self.instance.target_positions[i]
+                opts = [(float(tp[2]), float(tp[3]))]
+                area = opts[0][0] * opts[0][1]
+            elif st.role == 'mib_follower' and st.mib_leader in self.mib_shape:
+                lw, lh = self.mib_shape[st.mib_leader]
+                opts = [(lw, lh)]
+            else:
+                opts = [(math.sqrt(area * r), math.sqrt(area / r)) for r in self.aspect_ratios]
+            if area > 0:
+                rest.append((area, opts))
+        rest.sort(key=lambda t: -t[0])
+        self._upcoming_key, self._upcoming_cache = key, [o for _, o in rest[:self.lookahead]]
+        return self._upcoming_cache
+
+    def step_features(self) -> torch.Tensor:
+        """[NUM_STEP_FEATS] summary of what is still to come, for the policy
+        and value heads (rl/networks.py): (current + future block area) /
+        free canvas area; largest future block's area / free area; its
+        size / canvas width and / canvas height; share of its shape options
+        that still fit somewhere now (fine grid; 1.0 on the coarse path);
+        fraction of steps left. Cached per step."""
+        if getattr(self, '_feat_key', None) == self._cursor:
+            return self._feat_cache
+        cw, ch = self.x_max - self.x_min, self.y_max - self.y_min
+        if self.frame_util is not None:   # the frame is the space actually available
+            cw, ch = self.anchor_x_max - self.x_min, self.anchor_y_max - self.y_min
+        placed = sum(p[2] * p[3] for p in self.positions if p is not None)
+        free = max(cw * ch - placed, 1e-9)
+        cur_area = float(self.instance.area_targets[self.current_step().block_idx]) if not self.done() else 0.0
+        future, largest, opts = 0.0, 0.0, []
+        for st in self._pending[self._cursor + 1:]:
+            i = st.block_idx
+            if st.role == 'fixed':
+                tp = self.instance.target_positions[i]
+                a, o = float(tp[2]) * float(tp[3]), [(float(tp[2]), float(tp[3]))]
+            elif st.role == 'mib_follower' and st.mib_leader in self.mib_shape:
+                lw, lh = self.mib_shape[st.mib_leader]
+                a, o = lw * lh, [(lw, lh)]
+            else:
+                a = max(float(self.instance.area_targets[i]), 0.0)
+                o = [(math.sqrt(a * r), math.sqrt(a / r)) for r in self.aspect_ratios]
+            future += a
+            if a > largest:
+                largest, opts = a, o
+        fit = 1.0
+        if opts and self.fine_factor > 1:
+            sat = self._occ_sats()[0]
+            ok = 0
+            for (bw, bh) in opts:
+                fw = max(1, math.ceil(bw / self.fine_cell_w - 1e-9))
+                fh = max(1, math.ceil(bh / self.fine_cell_h - 1e-9))
+                ok += fw <= self.fine_dim and fh <= self.fine_dim and bool(
+                    (self._window_sums(self.fine_occ, fw, fh, sat=sat) == 0).any())
+            fit = ok / len(opts)
+        # Size of the largest future block: its real w/h if its shape is set,
+        # else its square size.
+        side_w, side_h = opts[0] if len(opts) == 1 else (math.sqrt(largest), math.sqrt(largest))
+        n_left = len(self._pending) - self._cursor - 1
+        f = torch.tensor([(cur_area + future) / free, largest / free,
+                          min(side_w, cw) / cw if opts else 0.0, min(side_h, ch) / ch if opts else 0.0,
+                          fit, n_left / max(len(self._pending), 1)], dtype=torch.float32)
+        self._feat_key, self._feat_cache = self._cursor, f
+        return f
+
+    def lookahead_ok(self, gy: int, gx: int) -> bool:
+        """True if, after place(gy, gx), each of the `lookahead` largest
+        unplaced blocks still fits somewhere in at least one of its shapes.
+        Always True when lookahead is off."""
+        if not self.lookahead:
+            return True
+        upcoming = self._upcoming_shapes()
+        if not upcoming:
+            return True
+        x, y, w, h = self._resolve_placement(gy, gx)
+        grid = self.fine_occ.clone()
+        fx0, fy0, fx1, fy1 = self._fine_rect_to_cells(x, y, w, h)
+        grid[fy0:fy1, fx0:fx1] = 1.0
+        sat = self._sat(grid)
+        for opts in upcoming:
+            fits = False
+            for (bw, bh) in opts:
+                fw = max(1, math.ceil(bw / self.fine_cell_w - 1e-9))
+                fh = max(1, math.ceil(bh / self.fine_cell_h - 1e-9))
+                if fw <= self.fine_dim and fh <= self.fine_dim and \
+                        bool((self._window_sums(grid, fw, fh, sat=sat) == 0).any()):
+                    fits = True
+                    break
+            if not fits:
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Output

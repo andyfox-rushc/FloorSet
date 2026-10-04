@@ -5,6 +5,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
+import torch
+
+# Small ops only; extra threads just oversubscribe cores when training runs
+# alongside (the suite went from ~3 min to 25+ min).
+torch.set_num_threads(1)
 
 from rl.env import GridPlacementEnv
 
@@ -17,7 +22,11 @@ def _run_once(env: GridPlacementEnv, seed: int):
         steps += 1
         assert steps < max_steps, "rollout did not terminate"
         if env.needs_aspect():
-            idx = rng.randrange(len(env.aspect_ratios))
+            # Same restriction the policy uses (see collect_episode).
+            legal = env.aspect_mask().nonzero().flatten().tolist()
+            if not legal:
+                raise RuntimeError("no shape fits anywhere")
+            idx = rng.choice(legal)
             w, h = env.choose_aspect(idx)
         else:
             w, h = env.current_shape()

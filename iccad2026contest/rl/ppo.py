@@ -62,15 +62,15 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
-from iccad2026_evaluate import M_PENALTY
-
 from .encoder import build_block_features, build_pin_features
 from .env import GridPlacementEnv
-from .networks import NEG_INF, ActorCritic, masked_log_softmax
-from .reward import _reward_and_violation_factor, step_quality_delta
+from .networks import NEG_INF, NUM_STEP_FEATS, ActorCritic, masked_log_softmax
+from .reward import _reward_and_violation_factor, infeasible_penalty, step_quality_delta
 
 
 MIN_TEMPERATURE = 1e-3
+# Re-draws allowed per position step when env.lookahead_ok rejects a cell.
+LOOKAHEAD_MAX_TRIES = 8
 
 
 def _temp_scale(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -99,6 +99,17 @@ def _masked_log_softmax_rows(logits: torch.Tensor, mask: torch.Tensor) -> torch.
     return F.log_softmax(filled.reshape(n, -1), dim=1).reshape(logits.shape)
 
 
+def _normalize_advantages(adv: torch.Tensor) -> torch.Tensor:
+    """Zero-mean, unit-std across the batch (standard PPO): keeps the policy
+    term's scale independent of the reward's, so the value loss can't swamp
+    it under clip_grad_norm_. Left unscaled when there's no spread to use.
+    Opt-in: fine-tuning needs it (the pretrained value head is biased ~+5
+    on normalized inference returns); offline training's are already O(1)."""
+    if adv.numel() < 2:
+        return adv
+    return (adv - adv.mean()) / (adv.std() + 1e-8)
+
+
 @dataclass
 class Transition:
     kind: str  # 'aspect' | 'position'
@@ -112,6 +123,7 @@ class Transition:
     wiremask: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
     step_reward: float = 0.0    # this step's own causal piece (0 for 'aspect' steps)
+    feats: Optional[torch.Tensor] = None   # env.step_features() at this step
     return_to_go: float = 0.0   # filled in after the episode ends; see collect_episode
 
 
@@ -132,7 +144,9 @@ def canvas_scale_of(instance) -> float:
 
 
 def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: bool,
-                     temperature: float = 1.0, greedy: bool = False) -> Episode:
+                     temperature: float = 1.0, greedy: bool = False,
+                     env_kwargs: Optional[dict] = None,
+                     use_aspect_mask: bool = True) -> Episode:
     """`temperature` controls how peaked the sampling distribution is
     (annealed lower over training -- see finetune.py -- to reduce output
     variance as the policy converges); `greedy` picks each distribution's
@@ -142,8 +156,12 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
     The working canvas is sized by GridPlacementEnv itself, directly from
     this instance's own pins bounding box (see rl/env.py's
     _estimate_canvas_size) -- no scouting or separate estimation pass
-    needed here."""
-    env = GridPlacementEnv(instance, grid_dim=grid_dim)
+    needed here.
+
+    `use_aspect_mask` restricts each free block's shape choice to aspect
+    ratios that fit somewhere right now (env.aspect_mask()); the mask is
+    stored on the Transition so ppo_update applies the same one."""
+    env = GridPlacementEnv(instance, grid_dim=grid_dim, **(env_kwargs or {}))
     scale = canvas_scale_of(instance)
     block_feats = build_block_features(instance, scale)
     pin_feats = build_pin_features(instance, scale)
@@ -160,16 +178,23 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
         while not env.done():
             step = env.current_step()
             progress = env._cursor / total_steps
-            progress_t = torch.tensor(progress, dtype=torch.float32)
+            feats = env.step_features()
+            progress_t = torch.cat([torch.tensor([progress], dtype=torch.float32), feats])
 
             if env.needs_aspect():
+                aspect_mask = env.aspect_mask() if use_aspect_mask else None
+                if aspect_mask is not None and not bool(aspect_mask.any()):
+                    raise RuntimeError(f"block {step.block_idx} fits nowhere in any shape")
                 with torch.no_grad():
-                    logits = net.aspect_logits(block_emb, global_emb, step.block_idx, progress_t)
-                    log_probs = F.log_softmax(_temp_scale(logits, temperature), dim=0)
+                    logits = _temp_scale(net.aspect_logits(block_emb, global_emb, step.block_idx,
+                                                           progress_t), temperature)
+                    log_probs = (F.log_softmax(logits, dim=0) if aspect_mask is None
+                                 else masked_log_softmax(logits, aspect_mask))
                     action = (int(torch.argmax(log_probs).item()) if greedy
                               else torch.multinomial(log_probs.exp(), 1).item())
                 transitions.append(Transition('aspect', step.block_idx, progress, action,
-                                               log_probs[action].item(), temperature=temperature))
+                                               log_probs[action].item(), temperature=temperature,
+                                               mask=aspect_mask, feats=feats))
                 w, h = env.choose_aspect(action)
             else:
                 w, h = env.current_shape()
@@ -197,27 +222,41 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
                 full_logits = net.position_logits(occupancy_before, cluster_grid, wiremask, block_emb,
                                                    global_emb, step.block_idx, progress_t)
                 cropped = _temp_scale(full_logits[:out_h, :out_w], temperature)
-                log_probs = masked_log_softmax(cropped, mask).reshape(-1)
-                flat_action = (int(torch.argmax(log_probs).item()) if greedy
-                               else torch.multinomial(log_probs.exp(), 1).item())
+                # Dead-end lookahead (env.lookahead_ok): a rejected cell is
+                # masked out and the action re-drawn; the reduced mask is what
+                # the Transition stores, so PPO scores the same distribution.
+                for attempt in range(LOOKAHEAD_MAX_TRIES + 1):
+                    log_probs = masked_log_softmax(cropped, mask).reshape(-1)
+                    flat_action = (int(torch.argmax(log_probs).item()) if greedy
+                                   else torch.multinomial(log_probs.exp(), 1).item())
+                    gy, gx = divmod(flat_action, out_w)
+                    if attempt == LOOKAHEAD_MAX_TRIES or env.lookahead_ok(gy, gx):
+                        break
+                    reduced = mask.clone()
+                    reduced[gy, gx] = False
+                    if not bool(reduced.any()):
+                        break
+                    mask = reduced
 
-            gy, gx = divmod(flat_action, out_w)
             tr = Transition('position', step.block_idx, progress, flat_action,
                              log_probs[flat_action].item(), temperature=temperature,
                              occupancy=occupancy_before, cluster_grid=cluster_grid,
-                             wiremask=wiremask, mask=mask)
+                             wiremask=wiremask, mask=mask, feats=feats)
             transitions.append(tr)
             env.place(gy, gx)
             delta_wl, delta_area = env.last_step_deltas
             tr.step_reward = step_quality_delta(delta_wl, delta_area, use_baseline,
-                                                 instance.baseline_metrics)
+                                                 instance.baseline_metrics,
+                                                 instance.reference_metrics)
 
         positions = env.finalize()
     except RuntimeError:
         pass  # ran out of grid space for this rollout's action sequence
 
     if positions is None:
-        reward, violation_factor = -M_PENALTY, 1.0
+        placed_fraction = env._cursor / max(len(env._pending), 1)
+        reward, violation_factor = infeasible_penalty(instance, use_baseline,
+                                                      placed_fraction=placed_fraction), 1.0
     else:
         reward, violation_factor = _reward_and_violation_factor(instance, positions, use_baseline)
 
@@ -275,9 +314,10 @@ def _worker_init(net_kwargs: dict) -> None:
     _worker_net = ActorCritic(**net_kwargs)
 
 
-def _worker_collect_episode(state_dict, instance, grid_dim, use_baseline, temperature):
+def _worker_collect_episode(state_dict, instance, grid_dim, use_baseline, temperature, env_kwargs=None):
     _worker_net.load_state_dict(state_dict)
-    return collect_episode(_worker_net, instance, grid_dim, use_baseline, temperature=temperature)
+    return collect_episode(_worker_net, instance, grid_dim, use_baseline, temperature=temperature,
+                           env_kwargs=env_kwargs)
 
 
 def make_episode_pool(num_workers: int, hidden_dim: int = 64, num_gnn_layers: int = 3,
@@ -295,7 +335,8 @@ def make_episode_pool(num_workers: int, hidden_dim: int = 64, num_gnn_layers: in
 
 def collect_batch(net: ActorCritic, instance, grid_dim: int, use_baseline: bool,
                    num_episodes: int, temperature: float = 1.0,
-                   deadline: Optional[float] = None, pool=None) -> List[Episode]:
+                   deadline: Optional[float] = None, pool=None,
+                   env_kwargs: Optional[dict] = None) -> List[Episode]:
     """`deadline` (an absolute time.time() value), if given, stops starting
     new episodes once passed -- so a slow per-episode rollout can't blow the
     caller's time budget by a full batch's worth of episodes (see
@@ -313,14 +354,15 @@ def collect_batch(net: ActorCritic, instance, grid_dim: int, use_baseline: bool,
         if deadline is not None and time.time() >= deadline:
             return []
         state_dict = net.state_dict()
-        args = [(state_dict, instance, grid_dim, use_baseline, temperature)] * num_episodes
+        args = [(state_dict, instance, grid_dim, use_baseline, temperature, env_kwargs)] * num_episodes
         return pool.starmap(_worker_collect_episode, args)
 
     episodes = []
     for _ in range(num_episodes):
         if deadline is not None and time.time() >= deadline:
             break
-        episodes.append(collect_episode(net, instance, grid_dim, use_baseline, temperature=temperature))
+        episodes.append(collect_episode(net, instance, grid_dim, use_baseline, temperature=temperature,
+                                        env_kwargs=env_kwargs))
     return episodes
 
 
@@ -334,6 +376,7 @@ def ppo_update(
     entropy_coef: float = 0.01,
     epochs: int = 4,
     max_grad_norm: float = 1.0,
+    normalize_advantages: bool = False,
 ) -> dict:
     """Batches every transition across all episodes into a handful of single
     forward calls per epoch, instead of one Python-level call per transition.
@@ -365,7 +408,10 @@ def ppo_update(
         count = max(len(rows), 1)
 
         global_emb_batch = torch.stack([r['global_emb'] for r in rows])
-        progress_batch = torch.tensor([r['tr'].progress for r in rows], dtype=torch.float32)
+        progress_batch = torch.stack([
+            torch.cat([torch.tensor([r['tr'].progress], dtype=torch.float32),
+                       r['tr'].feats if r['tr'].feats is not None else torch.zeros(NUM_STEP_FEATS)])
+            for r in rows])
         reward_so_far_batch = torch.tensor([r['reward_so_far'] for r in rows], dtype=torch.float32)
         return_batch = torch.tensor([r['tr'].return_to_go for r in rows], dtype=torch.float32)
         reward_t_batch = torch.tensor([r['ep_reward'] for r in rows], dtype=torch.float32)
@@ -373,6 +419,8 @@ def ppo_update(
         value_batch = net.value_batch(global_emb_batch, progress_batch, reward_so_far_batch)
         reward_pred_batch = net.reward_approx_batch(global_emb_batch, progress_batch, reward_so_far_batch)
         advantage_batch = (return_batch - value_batch).detach()
+        if normalize_advantages:
+            advantage_batch = _normalize_advantages(advantage_batch)
 
         value_loss_sum = ((value_batch - return_batch) ** 2).sum()
         reward_loss_sum = ((reward_pred_batch - reward_t_batch) ** 2).sum()
@@ -390,10 +438,13 @@ def ppo_update(
             adv_a = advantage_batch[aspect_idx]
 
             logits_a = net.aspect_logits_batch(block_emb_a, global_emb_batch[aspect_idx], progress_batch[aspect_idx])
-            log_probs_a = F.log_softmax(_temp_scale_batch(logits_a, temp_a), dim=-1)
+            # Transitions collected without an aspect mask count as all-legal.
+            mask_a = torch.stack([r['tr'].mask if r['tr'].mask is not None
+                                  else torch.ones(logits_a.shape[1], dtype=torch.bool) for r in a_rows])
+            log_probs_a = _masked_log_softmax_rows(_temp_scale_batch(logits_a, temp_a), mask_a)
             new_lp_a = log_probs_a.gather(1, action_a.unsqueeze(1)).squeeze(1)
             probs_a = log_probs_a.exp()
-            entropy_a = -(probs_a * log_probs_a).sum(dim=1)
+            entropy_a = -(probs_a * log_probs_a * mask_a.to(log_probs_a.dtype)).sum(dim=1)
 
             ratio_a = torch.exp(new_lp_a - old_lp_a)
             surr1_a = ratio_a * adv_a

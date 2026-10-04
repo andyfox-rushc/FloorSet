@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from rl.compaction import compact
@@ -167,3 +168,12 @@ def test_boundary_pinned_block_compacts_in_both_axes():
     x_max_bb = max(p[0] + p[2] for p in result)
     assert abs((result[1][0] + result[1][2]) - x_max_bb) < 1e-6
     assert bbox_area(result) < bbox_area(positions)
+
+
+def test_right_pinned_block_pushed_out_to_overhanging_edge():
+    # Block 0 is right-pinned at x+w=6, but free block 1 sticks out to 9.
+    positions = [(4.0, 0.0, 2.0, 2.0), (0.0, 3.0, 9.0, 1.0)]
+    constraints = torch.tensor([[0, 0, 0, 0, 2], [0, 0, 0, 0, 0]], dtype=torch.float32)
+    out = compact(positions, constraints)
+    assert out[0][0] + out[0][2] == pytest.approx(max(p[0] + p[2] for p in out))
+    assert check_overlap(out)

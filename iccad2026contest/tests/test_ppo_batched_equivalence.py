@@ -14,6 +14,8 @@ reading the batched code, since it reshapes/stacks/gathers across episodes
 and transition kinds rather than computing one transition's loss at a time.
 """
 
+import copy
+
 import torch
 import torch.nn.functional as F
 
@@ -24,7 +26,7 @@ from rl.ppo import _temp_scale, collect_batch, ppo_update
 
 def _ppo_update_reference(net, optimizer, episodes, clip_eps=0.2, value_coef=0.5,
                            reward_approx_coef=0.5, entropy_coef=0.01, epochs=4,
-                           max_grad_norm=1.0):
+                           max_grad_norm=1.0, normalize_advantages=False):
     last_stats = {}
     for _ in range(epochs):
         optimizer.zero_grad()
@@ -34,25 +36,45 @@ def _ppo_update_reference(net, optimizer, episodes, clip_eps=0.2, value_coef=0.5
         entropy_sum = torch.tensor(0.0)
         count = 0
 
+        # Advantage normalization (added 2026-09-25) needs every transition's
+        # raw advantage first, so it's one extra no-grad pass over the batch.
+        with torch.no_grad():
+            raw_adv = []
+            for ep in episodes:
+                _, global_emb = net.encode(ep.block_feats, ep.pin_feats, ep.b2b_edges, ep.p2b_edges)
+                reward_so_far = 0.0
+                for tr in ep.transitions:
+                    value = net.value(global_emb, torch.cat([torch.tensor([tr.progress], dtype=torch.float32), tr.feats if tr.feats is not None else torch.zeros(6)]),
+                                      torch.tensor(reward_so_far, dtype=torch.float32))
+                    raw_adv.append(tr.return_to_go - value.item())
+                    reward_so_far += tr.step_reward
+            adv_t = torch.tensor(raw_adv, dtype=torch.float32)
+            if normalize_advantages and adv_t.numel() >= 2:
+                adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        adv_iter = iter(adv_t.tolist())
+
         for ep in episodes:
             block_emb, global_emb = net.encode(ep.block_feats, ep.pin_feats, ep.b2b_edges, ep.p2b_edges)
             reward_t = torch.tensor(ep.reward, dtype=torch.float32)
 
             reward_so_far = 0.0
             for tr in ep.transitions:
-                progress_t = torch.tensor(tr.progress, dtype=torch.float32)
+                progress_t = torch.cat([torch.tensor([tr.progress], dtype=torch.float32), tr.feats if tr.feats is not None else torch.zeros(6)])
                 return_t = torch.tensor(tr.return_to_go, dtype=torch.float32)
                 reward_so_far_t = torch.tensor(reward_so_far, dtype=torch.float32)
                 value = net.value(global_emb, progress_t, reward_so_far_t)
                 reward_pred = net.reward_approx(global_emb, progress_t, reward_so_far_t)
-                advantage = (return_t - value).detach()
+                advantage = torch.tensor(next(adv_iter), dtype=torch.float32)
 
                 if tr.kind == 'aspect':
                     logits = net.aspect_logits(block_emb, global_emb, tr.block_idx, progress_t)
-                    log_probs = F.log_softmax(_temp_scale(logits, tr.temperature), dim=0)
+                    scaled = _temp_scale(logits, tr.temperature)
+                    log_probs = (F.log_softmax(scaled, dim=0) if tr.mask is None
+                                 else masked_log_softmax(scaled, tr.mask))
                     new_log_prob = log_probs[tr.action]
                     probs = log_probs.exp()
-                    entropy = -(probs * log_probs).sum()
+                    legal = torch.ones_like(probs) if tr.mask is None else tr.mask.to(probs.dtype)
+                    entropy = -(probs * log_probs * legal).sum()
                 else:
                     full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, tr.wiremask,
                                                         block_emb, global_emb, tr.block_idx, progress_t)
@@ -115,11 +137,17 @@ def test_batched_update_matches_reference_loop():
             torch.manual_seed(1000 + seed)
             episodes = collect_batch(net_ref, inst, grid_dim=12, use_baseline=False, num_episodes=6)
 
-            stats_ref = _ppo_update_reference(net_ref, opt_ref, episodes, epochs=1)
-            stats_new = ppo_update(net_new, opt_new, episodes, epochs=1)
+            for norm in (False, True):
+                net_r, net_n = copy.deepcopy(net_ref), copy.deepcopy(net_new)
+                opt_r = torch.optim.Adam(net_r.parameters(), lr=3e-3)
+                opt_n = torch.optim.Adam(net_n.parameters(), lr=3e-3)
+                stats_ref = _ppo_update_reference(net_r, opt_r, episodes, epochs=1,
+                                                  normalize_advantages=norm)
+                stats_new = ppo_update(net_n, opt_n, episodes, epochs=1,
+                                       normalize_advantages=norm)
 
-            for key in stats_ref:
-                a, b = stats_ref[key], stats_new[key]
-                assert abs(a - b) <= 1e-3 * max(1.0, abs(a)), (
-                    f"seed={seed} n={n} stat={key}: reference={a!r} batched={b!r}"
-                )
+                for key in stats_ref:
+                    a, b = stats_ref[key], stats_new[key]
+                    assert abs(a - b) <= 1e-3 * max(1.0, abs(a)), (
+                        f"seed={seed} n={n} norm={norm} stat={key}: reference={a!r} batched={b!r}"
+                    )

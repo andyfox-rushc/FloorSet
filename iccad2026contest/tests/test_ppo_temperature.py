@@ -86,10 +86,12 @@ def test_ppo_ratio_is_identity_before_any_update():
 
     block_emb, global_emb = net.encode(ep.block_feats, ep.pin_feats, ep.b2b_edges, ep.p2b_edges)
     for tr in ep.transitions:
-        progress_t = torch.tensor(tr.progress, dtype=torch.float32)
+        progress_t = torch.cat([torch.tensor([tr.progress], dtype=torch.float32), tr.feats if tr.feats is not None else torch.zeros(6)])
         if tr.kind == 'aspect':
             logits = net.aspect_logits(block_emb, global_emb, tr.block_idx, progress_t)
-            log_probs = F.log_softmax(_temp_scale(logits, tr.temperature), dim=0)
+            scaled = _temp_scale(logits, tr.temperature)
+            log_probs = (F.log_softmax(scaled, dim=0) if tr.mask is None
+                         else masked_log_softmax(scaled, tr.mask))
             new_log_prob = log_probs[tr.action].item()
         else:
             full_logits = net.position_logits(tr.occupancy, tr.cluster_grid, tr.wiremask,
