@@ -1,8 +1,10 @@
 ### FloorSet - a VLSI Floorplanning Dataset with Design Constraints of Real-World SoCs
 
-This branch contains a naiive attempt at using Claude to produce a macro floorplanner for the ICCAD 2026 Contest Problem C dataset. It is just a fun experiment, I was interested to see how reinforcement learning works and whether the combination of Claude with a little steering could produce anything meaningful for a floorplanner. Coding started by simply gigiving Claude all of Anna Goldie's PhD thesis (I enjoyed reading that thesis and thought it might be fun to see what the reinforcement learning stuff is all about). When the runtime factor is removed from the scoring equation (this code is all slow python) then the preliminary results are encouraging. The document floorplan_code.pdf shows how to get and run the code. The document progress_report.pdf shows the current state of play. 
+This branch contains a naiive attempt at using Claude to produce a macro floorplanner for the ICCAD 2026 Contest Problem C dataset. It is just a fun experiment, I was interested to see how reinforcement learning works and whether the combination of Claude with a little steering could produce anything meaningful for a floorplanner. Coding started by simply gigiving Claude all of Anna Goldie's PhD thesis (I enjoyed reading that thesis and thought it might be fun to see what the reinforcement learning stuff is all about). When the runtime factor is removed from the scoring equation (this code is all slow python) then the preliminary results are encouraging.
 
-Initial results are encouraging but I am still trying to work out what the hell Claude has done. 
+... but I am still trying to work out what the hell Claude has done. 
+
+See files floorplan_code.pdf and progress_report.pdf for more discussion.
 
 ## ICCAD 2026 Contest
 
