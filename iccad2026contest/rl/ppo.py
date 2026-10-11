@@ -206,6 +206,8 @@ def collect_episode(net: ActorCritic, instance, grid_dim: int, use_baseline: boo
                 for (gy, gx) in env.cluster_cells[cid]:
                     cluster_grid[gy, gx] = 1.0
             wiremask = env.wiremask(w, h)
+            if env._gp_centres is not None:   # target-map experiment: second channel
+                wiremask = torch.stack([wiremask, env.target_map(step.block_idx, w, h)])
 
             # A block whose chosen (extreme aspect ratio) shape no longer
             # fits anywhere is a real possibility with a stochastic,

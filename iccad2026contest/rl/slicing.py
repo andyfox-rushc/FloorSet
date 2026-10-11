@@ -221,10 +221,18 @@ def _candidate(P, cx, cy, W, H, split, pre_mode="tree"):
     x = rx + (rw - w) / 2
     y = ry + (rh - h) / 2
     x, y = np.where(pre, pos[:, 0], x), np.where(pre, pos[:, 1], y)
-    # MIB groups share one shape: the group's mean width, each block's own area.
+    # MIB groups share one shape: a fixed/preplaced member's if there is one
+    # (10-05: 56/100 groups; copying only among soft members left 44 MIB
+    # violations in 100 best-of results), else the soft members' mean width.
     for g in range(1, int(P["mib"].max(initial=0)) + 1):
-        m = np.where((P["mib"] == g) & soft)[0]
-        if len(m) > 1:
+        grp = P["mib"] == g
+        m = np.where(grp & soft)[0]
+        known = np.where(grp & ~soft)[0]
+        if len(known) and len(m):
+            ccx, ccy = x[m] + w[m] / 2, y[m] + h[m] / 2
+            w[m], h[m] = pos[known[0], 2], pos[known[0], 3]
+            x[m], y[m] = ccx - w[m] / 2, ccy - h[m] / 2
+        elif len(m) > 1:
             cw = float(np.mean(w[m]))
             ccx, ccy = x[m] + w[m] / 2, y[m] + h[m] / 2
             w[m], h[m] = cw, P["area"][m] / cw
@@ -249,7 +257,8 @@ def _legalize_grow(P, x, y, w, h, floors=(0.0, 0.0), rounds: int = 4):
 
 # NONEG (10-02): no floor below the origin -- a candidate that only fits by
 # growing past it is rejected (design 49: 17 blocks at x=-13, y=-10).
-NONEG = os.environ.get("FLOORSET_SLICE_NONEG", "0") != "0"
+NONEG = (os.environ.get("FLOORSET_SLICE_NONEG", "0") != "0"
+         or os.environ.get("FLOORSET_ORIGIN_UPSTREAM", "0") != "0")   # 10-06: upstream origin rule
 # PULLBACK (10-03): when the best layout went past the origin, also try it
 # with every movable block shifted back by the overhang (x, y or both) and
 # re-legalized at the origin; the contest cost picks. Design 0: bottom-pinned
@@ -288,12 +297,19 @@ def _evaluate(P, cost_fn, scale, x, y, w, h, floors=(0.0, 0.0)):
     return c * (1.0 + 20.0 * over / scale), lx, ly, over <= R.EPS, R._legalize.slack
 
 
+# Share of the polish budget for rl/legalize.py repair (walls + clusters),
+# 10-05; env FLOORSET_REPAIR, 0 = off.
+REPAIR = float(os.environ.get("FLOORSET_REPAIR", "0.3"))
+
 # Env FLOORSET_SLICE_MODES (10-03 test): "tree" alone drops "shift", which
 # translates the whole layout to line up preplaced blocks (design 0: -16, -33).
 PRE_MODES = tuple(os.environ.get("FLOORSET_SLICE_MODES", "tree,shift").split(","))
 
+# Env FLOORSET_SLICE_PINASPECT (10-07): also try roots with the pin box's aspect ratio.
+PIN_ASPECT = os.environ.get("FLOORSET_SLICE_PINASPECT", "1") != "0"
 
-def _roots(P, rl_aspect, total):
+
+def _roots(P, rl_aspect, total, box=None):
     """Root rectangles to try. The ground-truth bbox starts at (0, 0), so a
     right-pinned preplaced block's right edge IS its width (top-pinned: its
     height); every preplaced block's far edge is a lower bound."""
@@ -315,7 +331,9 @@ def _roots(P, rl_aspect, total):
             cands.append((W_known, a / W_known))
         if H_known:
             cands.append((a / H_known, H_known))
-        for asp in (rl_aspect, 1.0, rl_aspect ** 0.5):
+        # 10-07: the pin box's shape too (pins sit on the true outline)
+        asps = (rl_aspect, 1.0, rl_aspect ** 0.5) + ((box[0] / box[1],) if box and PIN_ASPECT else ())
+        for asp in asps:
             H = math.sqrt(a / asp)
             cands.append((a / H, H))
         for W, H in cands:
@@ -325,12 +343,16 @@ def _roots(P, rl_aspect, total):
     return roots
 
 
-def _search(P, cx, cy, rl_aspect, total, evaluate, start, time_budget):
+def _search(P, cx, cy, rl_aspect, total, evaluate, start, time_budget, box=None):
     """Best feasible (cost, x, y, w, h) over root rectangle / split rule /
     preplaced handling, and how many candidates were tried."""
     best, tried = None, 0
     pre_modes = PRE_MODES if P["preplaced"].any() else PRE_MODES[:1]
-    for W, H in _roots(P, rl_aspect, total):
+    roots = _roots(P, rl_aspect, total, box)
+    if box and PIN_ASPECT:      # pin-box-shaped roots first (they would otherwise be cut by the time limit)
+        a = box[0] / box[1]
+        roots.sort(key=lambda r: abs(math.log(r[0] / r[1] / a)))
+    for W, H in roots:
         for split in ("area", "gap"):
             for mode in pre_modes:
                 if time.time() - start > time_budget and best is not None:
@@ -360,10 +382,16 @@ def slicing_polish(instance, positions: List[Position], time_budget: float = 1.0
     def evaluate(x, y, w, h, floors=(0.0, 0.0)):
         return _evaluate(P, cost_fn, scale, x, y, w, h, floors)
 
-    best, tried = _search(P, cx, cy, bw / bh, total, evaluate, start, time_budget)
+    from .packer import pin_box
+    box = pin_box(instance)
+    box = box if box and all(math.isfinite(v) for v in box) else None
+    best, tried = _search(P, cx, cy, bw / bh, total, evaluate, start, time_budget, box)
     if best is None:
         return positions
     best = R._fix_boundary(best, evaluate, cost_fn, P)
+    if REPAIR > 0:
+        from .legalize import repair
+        best = repair(best, evaluate, cost_fn, P, time_budget=REPAIR * time_budget)
     cands = [best]
     if PULLBACK:
         cands += [R._fix_boundary(b, evaluate, cost_fn, P) for b in _pullbacks(P, cost_fn, scale, best)]

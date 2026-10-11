@@ -357,8 +357,10 @@ def _chain(P, time_budget: float, seed: int):
             deltas.append(c2 - cur)
     t0 = (float(np.mean(deltas)) / math.log(2)) if deltas else 0.01
     start = time.time()
+    from .slicing import REPAIR
+    anneal_budget = time_budget * (1.0 - REPAIR)
     while True:
-        frac = (time.time() - start) / max(time_budget, 1e-3)
+        frac = (time.time() - start) / max(anneal_budget, 1e-3)
         if frac >= 1.0:
             break
         temp = t0 * (0.001 ** frac)
@@ -370,6 +372,9 @@ def _chain(P, time_budget: float, seed: int):
                 best = (cur, x.copy(), y.copy(), w.copy(), h.copy())
     if best is not None:
         best = _fix_boundary(best, evaluate, cost_fn, P)
+        if REPAIR > 0:
+            from .legalize import repair
+            best = repair(best, evaluate, cost_fn, P, time_budget=REPAIR * time_budget)
     return None if best is None else _as_positions(best)
 
 

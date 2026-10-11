@@ -14,6 +14,8 @@ PolicyNet has two heads, mirroring the two-phase action in env.py:
                      [out_h, out_w] region and masks it (see rl/ppo.py).
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +29,22 @@ NEG_INF = -1e9
 # each head's first layer so older checkpoints migrate by appending zero
 # columns (scripts/migrate_checkpoint_step_features.py).
 NUM_STEP_FEATS = 6
+# Policy-architecture experiment switches (10-04, 3-arm A/B): FLOORSET_POS_NET
+# = "cnn" (default, 5x5-cell view) | "unet" (whole-canvas view);
+# FLOORSET_TARGET_MAP=1 adds the analytic placer's target map as a second
+# "wiremask" channel (rl/env.py target_map). Checkpoints only load into the
+# same architecture, so set the same switches when using them.
+POS_NET = os.environ.get("FLOORSET_POS_NET", "cnn")
+TARGET_MAP = os.environ.get("FLOORSET_TARGET_MAP", "0") != "0"
+
+
+def _spatial(occupancy, cluster_grid, wiremask, batched):
+    """Stack the spatial channels; wiremask may carry extra channels."""
+    if batched:
+        wm = wiremask if wiremask.dim() == 4 else wiremask.unsqueeze(1)
+        return torch.cat([occupancy.unsqueeze(1), cluster_grid.unsqueeze(1), wm], dim=1)
+    wm = wiremask if wiremask.dim() == 3 else wiremask.unsqueeze(0)
+    return torch.cat([occupancy.unsqueeze(0), cluster_grid.unsqueeze(0), wm], dim=0)
 
 
 def _ctx1(progress):
@@ -83,10 +101,10 @@ class PositionCNN(nn.Module):
     purely from the (spatially-uniform) block embedding broadcast below,
     with no explicit geometric hint. See rl/env.py's wiremask() docstring."""
 
-    def __init__(self, hidden_dim: int, cnn_channels: int = 16, conv_width: int = 32):
+    def __init__(self, hidden_dim: int, cnn_channels: int = 16, conv_width: int = 32, map_channels: int = 3):
         super().__init__()
         self.embed_proj = nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, cnn_channels)
-        self.conv1 = nn.Conv2d(3 + cnn_channels, conv_width, 3, padding=1)
+        self.conv1 = nn.Conv2d(map_channels + cnn_channels, conv_width, 3, padding=1)
         self.conv2 = nn.Conv2d(conv_width, conv_width, 3, padding=1)
         self.conv3 = nn.Conv2d(conv_width, 1, 1)
 
@@ -94,7 +112,7 @@ class PositionCNN(nn.Module):
         g = occupancy.shape[0]
         ctx = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
         emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
-        x = torch.stack([occupancy, cluster_grid, wiremask], dim=0)
+        x = _spatial(occupancy, cluster_grid, wiremask, batched=False)
         x = torch.cat([x, emb_map], dim=0).unsqueeze(0)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
@@ -110,11 +128,57 @@ class PositionCNN(nn.Module):
         n, g, _ = occupancy.shape
         ctx = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
         emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
-        x = torch.stack([occupancy, cluster_grid, wiremask], dim=1)
+        x = _spatial(occupancy, cluster_grid, wiremask, batched=True)
         x = torch.cat([x, emb_map], dim=1)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         return self.conv3(x)[:, 0]
+
+
+class PositionUNet(nn.Module):
+    """Whole-canvas position head (10-04 experiment): same inputs and output
+    as PositionCNN, but two stride-2 downsamplings, three dilated 3x3 layers
+    (dilation 1/2/4) and a global-average term at 1/4 resolution, then
+    upsampling with skip connections, so every cell's score can depend on
+    the whole canvas (PositionCNN sees 5x5 cells)."""
+
+    def __init__(self, hidden_dim: int, cnn_channels: int = 16, width: int = 32, map_channels: int = 3):
+        super().__init__()
+        self.embed_proj = nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, cnn_channels)
+        self.inp = nn.Conv2d(map_channels + cnn_channels, width, 3, padding=1)
+        self.down1 = nn.Conv2d(width, width, 3, stride=2, padding=1)
+        self.down2 = nn.Conv2d(width, width, 3, stride=2, padding=1)
+        self.mid = nn.ModuleList([nn.Conv2d(width, width, 3, padding=d, dilation=d) for d in (1, 2, 4)])
+        self.glob = nn.Linear(width, width)
+        self.up2 = nn.Conv2d(width, width, 3, padding=1)
+        self.up1 = nn.Conv2d(width, width, 3, padding=1)
+        self.out = nn.Conv2d(width, 1, 1)
+
+    def _net(self, x):
+        c1 = F.relu(self.inp(x))
+        d1 = F.relu(self.down1(c1))
+        m = F.relu(self.down2(d1))
+        for conv in self.mid:
+            m = F.relu(conv(m)) + m
+        m = m + self.glob(m.mean(dim=(2, 3)))[:, :, None, None]
+        u = F.relu(self.up2(F.interpolate(m, size=d1.shape[2:], mode="nearest") + d1))
+        u = F.relu(self.up1(F.interpolate(u, size=c1.shape[2:], mode="nearest") + c1))
+        return self.out(u)[:, 0]
+
+    def forward(self, occupancy, cluster_grid, wiremask, block_embedding, global_embedding, progress):
+        g = occupancy.shape[0]
+        ctx = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
+        emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
+        x = torch.cat([_spatial(occupancy, cluster_grid, wiremask, batched=False), emb_map], dim=0)
+        return self._net(x.unsqueeze(0))[0]
+
+    def forward_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                      global_embeddings, progresses):
+        n, g, _ = occupancy.shape
+        ctx = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
+        emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
+        x = torch.cat([_spatial(occupancy, cluster_grid, wiremask, batched=True), emb_map], dim=1)
+        return self._net(x)
 
 
 class ScalarHead(nn.Module):
@@ -160,7 +224,9 @@ class ActorCritic(nn.Module):
         self.hidden_dim = hidden_dim
         self.encoder = NetlistEncoder(hidden_dim=hidden_dim, num_layers=num_gnn_layers)
         self.aspect_head = AspectHead(hidden_dim, num_aspects)
-        self.position_cnn = PositionCNN(hidden_dim, cnn_channels=cnn_channels)
+        map_channels = 4 if TARGET_MAP else 3
+        pos_cls = PositionUNet if POS_NET == "unet" else PositionCNN
+        self.position_cnn = pos_cls(hidden_dim, cnn_channels=cnn_channels, map_channels=map_channels)
         self.value_head = ScalarHead(hidden_dim)
         self.reward_approx_head = ScalarHead(hidden_dim)
 

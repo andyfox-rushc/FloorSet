@@ -380,6 +380,15 @@ class GridPlacementEnv:
         self.mib_shape: Dict[int, Tuple[float, float]] = {}
         self.cluster_cells: Dict[int, set] = defaultdict(set)
         self.boundary_fallback_count = 0
+        # Analytic placer targets for the policy's target-map channel
+        # (networks.TARGET_MAP experiment, 10-04): one global placement per
+        # episode; block centres in canvas coordinates.
+        self._gp_centres = None
+        from .networks import TARGET_MAP
+        if TARGET_MAP:
+            from .analytic import global_place
+            gp = global_place(self.instance, util=0.85, iters=150)
+            self._gp_centres = [(x + w / 2, y + h / 2) for x, y, w, h in gp]
         self.grouping_fallback_count = 0
 
         # Adjacency for wiremask() -- built once so each step's wiremask
@@ -999,6 +1008,22 @@ class GridPlacementEnv:
         kernel = torch.ones(1, 1, cells_h, cells_w)
         window_sum = F.conv2d(dilated.unsqueeze(0).unsqueeze(0), kernel)[0, 0]
         return (window_sum > 0) & free
+
+    def target_map(self, block_idx: int, w: float, h: float) -> torch.Tensor:
+        """[grid_dim, grid_dim]: a Gaussian bump (sigma = half the block size)
+        at the top-left cell that would centre this w x h block where the
+        episode's analytic global placement put it. Zeros without one."""
+        g = self.grid_dim
+        if self._gp_centres is None:
+            return torch.zeros(g, g)
+        cx, cy = self._gp_centres[block_idx]
+        col = (cx - w / 2 - self.x_min) / self.cell_w
+        row = (cy - h / 2 - self.y_min) / self.cell_h
+        sx = max(1.0, w / self.cell_w / 2)
+        sy = max(1.0, h / self.cell_h / 2)
+        ys = torch.arange(g, dtype=torch.float32).view(-1, 1)
+        xs = torch.arange(g, dtype=torch.float32).view(1, -1)
+        return torch.exp(-((xs - col) ** 2 / (2 * sx * sx) + (ys - row) ** 2 / (2 * sy * sy)))
 
     def wiremask(self, w: float, h: float) -> torch.Tensor:
         """[grid_dim, grid_dim] channel giving the current block's placement

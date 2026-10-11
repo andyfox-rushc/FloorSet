@@ -313,13 +313,22 @@ pytest tests/ -q
 `my_optimizer.py` is the contest entry point. It loads
 `checkpoints/policy.pt` automatically if present (falling back to a
 from-scratch policy otherwise), then runs `rl/finetune.py`'s per-instance
-PPO fine-tuning inside `solve()`.
+PPO fine-tuning inside `solve()` (2 s, a hard deadline), then builds six
+candidate layouts (`rl/analytic.py`'s `best_of`: the policy layout plus five
+analytic placements, each polished for 1 s with the edge/cluster repair) and
+runs the compact packer (`rl/packer.py`) on the best four; the cheapest
+result wins, and a wirelength relaxation (`relax_hpwl`) slides its blocks
+inside their slack. Candidates and packer runs execute in a pool of worker
+processes (`FLOORSET_PROCS`). About 7 s per design on average, 15 s at most
+(official evaluator, 10-06 evening: weighted 1.225). See "Solve pipeline
+and policy analysis, 2026-09-15 to 10-05", "Solve stage, 10-05 to 10-06"
+and "Preplaced walls and wirelength relaxation, 10-06" below.
 
 ```bash
 # One validation case (0-99), with live fine-tuning progress
 python iccad2026_evaluate.py --evaluate my_optimizer.py --test-id 0 --verbose
 
-# All 100 validation cases (slow: ~20s x 100 by default)
+# All 100 validation cases (~8 s x 100, ~13 min)
 python iccad2026_evaluate.py --evaluate my_optimizer.py
 
 # Check submission format only (fast, doesn't run a full solve)
@@ -328,9 +337,13 @@ python iccad2026_evaluate.py --validate my_optimizer.py --quick
 
 Per-instance fine-tuning speed/quality is controlled by `MyOptimizer`'s
 constructor in `my_optimizer.py` (`time_budget`, `max_iterations`,
-`episodes_per_iter`, `ppo_epochs`) -- lower `time_budget` for a faster
-sweep across all 100 cases, raise it once a good checkpoint exists and you
-want the best score.
+`episodes_per_iter`, `ppo_epochs`, `anneal_time_budget` for the polish).
+Raising the budgets barely helps: a 09-28 sweep on 100 designs gave 20+8 s
+1.607 at 28.9 s vs 2+1 s 1.643 at 4.3 s, and the contest multiplies cost
+by `max(0.7, (runtime/median)^0.3)`. `FLOORSET_CANDIDATES=""` turns off
+best-of and falls back to the policy layout + slicing/re-pack polish
+(1.548 at 4.5 s); `FLOORSET_PACK=0` turns off the packer, `FLOORSET_RELAX=0`
+the wirelength relaxation.
 
 ### Training (`rl/train.py`)
 
@@ -466,7 +479,14 @@ iccad2026contest/
 | `ppo.py` | Episode rollout collection and the PPO clipped-surrogate update, including temperature-annealed/greedy sampling and gradient clipping |
 | `pretrain.py` | Staged encoder warm-start: supervised regression to predict realized episode reward, then the prediction head is discarded and only the trained encoder is kept (mirrors the actual paper's mechanism -- see above) |
 | `finetune.py` | Per-instance PPO fine-tuning used inside `my_optimizer.py`'s `solve()`, since the hidden test set exposes no ground-truth baseline to pretrain against |
-| `anneal.py` | Post-RL simulated-annealing polish (`anneal_polish`), run in `my_optimizer.py`'s `solve()` after `finetune_and_solve` returns -- locally perturbs (translate/swap/rotate) the already-feasible, already-compacted layout and keeps whatever lowers `inference_reward`'s baseline-free cost, since the RL policy places each block once, in order, and never revisits an earlier choice in light of later ones |
+| `compaction.py` | Deterministic gravity compaction (slide every block toward the origin, pinned blocks to their edges); `reward.py` scores the compacted layout |
+| `slicing.py` | Slicing re-pack polish: rebuilds the layout as a guillotine floorplan in the policy's order, soft blocks at their exact area, then legalizes and snaps edge pins |
+| `repack.py` | Constraint-graph re-pack (left/right/above/below relations from geometry, tightest coordinates) + annealing; `_fix_boundary` snaps blocks still off their required edge |
+| `analytic.py` | Analytic global placer (gradient descent on smoothed wirelength + overlap/outline penalties), `build_candidate` and `best_of` (the candidate layouts) |
+| `legalize.py` | `repair` (blocks past the walls revealed by pinned preplaced blocks into holes, cut-off cluster members back to their cluster), run after the edge snaps in slicing and re-pack; also an experimental Tetris legalizer (off) |
+| `packer.py` | Compact packer: sequence pair from the layout, batched numpy packing and contest cost, annealing; `pack_budget` scales its time with block count |
+| `anneal.py` | The original simulated-annealing polish (`anneal_polish`); replaced by `repack.py` on 09-26, still selectable with `FLOORSET_POLISH=anneal` |
+| `checkpoint_meta.py` | `<checkpoint>.meta.json` sidecar: the canvas utilization the training curriculum reached, learning-rate origin, iteration |
 | `train.py` | The offline pretraining CLI documented above |
 
 ### `tests/`
@@ -485,7 +505,14 @@ evaluator.
 ### `checkpoints/`
 
 - `policy.pt` -- the canonical "latest" checkpoint. This is what
-  `my_optimizer.py` loads automatically and what `--resume` reads.
+  `my_optimizer.py` loads automatically and what `--resume` reads. Since
+  10-05 it's iteration 4000 of the 10-04 "arm A" run
+  (`ab_A/history/policy_iter004000.pt`); the previous one (09-28,
+  iteration 12000) is kept as `policy_installed_0928_iter12000.pt`.
+  `FLOORSET_CHECKPOINT` points the solver at a different file.
+- Experiment runs write to their own subdirectories (`scratch/`, `ab_A/`,
+  `exp_*/`). Some only load or only behave correctly with the environment
+  switches they were trained with -- see the switch table below.
 - `history/` -- versioned snapshots (`policy_iter<NNNNNN>.pt`), one saved
   alongside every periodic checkpoint during training. This is the only way
   to roll back to a specific point if a run destabilizes -- `policy.pt`
@@ -572,3 +599,465 @@ functional bug -- the network trains and the tests pass either way -- but
 anyone touching `rl/networks.py` or `rl/encoder.py` should trust the code
 over that older prose.
 
+
+## Solve pipeline and policy analysis, 2026-09-15 to 10-05
+
+Three weeks of work since the review above, condensed. The day-by-day
+record is in the progress reports (`progress_report_0927.pdf`,
+`progress_report_0928.pdf`, `progress_report_1003.pdf` -- the last one
+covers 9/28 to 10/5). All costs below are the contest cost averaged over
+the 100 validation designs (lower is better, ground truth = 1.0), without
+the runtime factor.
+
+**Where the score came from:**
+
+| Date  | Setup                                                    | Avg cost | Runtime  |
+|-------|----------------------------------------------------------|----------|----------|
+| 09-22 | Policy + 20 s fine-tune + anneal polish                  | 1.913    | ~30 s    |
+| 09-27 | Fine grid, curriculum, step features, re-pack polish     | 1.663    | ~28 s    |
+| 09-28 | Iteration 12000 policy, 20 s fine-tune + 8 s re-pack     | 1.644    | 30-40 s  |
+| 09-28 | 2 s fine-tune + 1 s slicing/re-pack, boundary snaps      | 1.552    | 4.5 s    |
+| 10-04 | Best-of: policy + two analytic placements                | 1.431    | 8.2 s    |
+| 10-05 | Same, policy replaced by arm A iteration 4000            | 1.424    | ~8 s     |
+| 10-05 | + edge/cluster repair, grouped-shape fix in slicing      | 1.354    | 8.5 s    |
+| 10-05 | + compact packer on the best candidate                   | 1.267    | 10.3 s   |
+| 10-06 | 6 candidates, best 4 packed, size-scaled packer time     | 1.199    | 23 s     |
+| 10-06 | Same in parallel workers (official evaluator)            | 1.212    | 7.8 s    |
+
+Nearly all of the gain since 09-28 is in the solve stage. The policy
+itself has moved the result by about 0.01 in that time.
+
+**The pipeline as it stands:**
+
+1. `rl/ordering.py`: connectivity walk over the blocks, boundary-pinned
+   and clustered blocks pulled earlier.
+2. `rl/env.py`: grid placement. The policy picks a cell on the action grid
+   (48x48 in training, 32-96 by block count at solve time,
+   `rl/finetune.py` `choose_grid_dim`); free space is tracked 4x finer (`DEFAULT_FINE_FACTOR=4`).
+   Hard rules are code, not learned: overlap, exact areas/shapes, edge
+   pins, cluster contact, an aspect mask (only shapes that fit somewhere
+   are offered), `shape_fit` (a free block's exact w/h is adjusted within
+   1.4x so it ends flush with its neighbours) and a lookahead check (a
+   cell is rejected if the next 3 largest unplaced blocks would no longer
+   fit). The canvas is sized from the pin box at a target utilization;
+   training tightens it adaptively (0.60 -> 0.70, stored in
+   `<checkpoint>.meta.json`) and the solver starts at the trained level and
+   loosens only if every rollout fails.
+3. Policy (`rl/networks.py`, ~74k parameters): GNN over the netlist, once
+   per design; per step, a `PositionCNN` over occupancy + cluster-mates +
+   wiremask, with the block/design embeddings and step features (progress
+   plus 6 numbers about what's still to come: remaining vs free area, the
+   largest unplaced block, how many of its shapes still fit) broadcast in.
+   The aspect head is an MLP and sees no maps.
+4. `rl/finetune.py`: 2 s of PPO on the design, then a greedy rollout. The
+   budget is a hard deadline.
+5. `rl/analytic.py` `best_of`: six candidates -- the policy layout and
+   five analytic placements (utilization 0.75-1.0, 600 iterations) --
+   each legalized and polished for 1 s by `rl/slicing.py` then
+   `rl/repack.py`, both ending with `rl/legalize.py`'s repair.
+6. `rl/packer.py`: the best four candidates by contest cost (no ground
+   truth needed) each go through the compact packer; the cheapest wins.
+   (Steps 5-6 were three candidates and no packer until 10-05; see
+   "Solve stage, 10-05 to 10-06".)
+
+**Policy experiments, and why each was dropped.** Every one was measured
+on the full pipeline against the installed policy under the same
+conditions, unless noted.
+
+| Experiment (switch)                                | Result                                                    |
+|----------------------------------------------------|-----------------------------------------------------------|
+| Area weight x3 / x6 in training reward             | Area gap unchanged (0.350 / 0.355), greedy cost worse     |
+| Train on slicing-packed reward (`SLICE_REWARD`)    | Stopped by a reboot at 13866, never scored                |
+| Edge-pinned blocks placed last (`EDGE_LAST`)       | Edge violations 3 -> 14 per design; retrain arm crashed   |
+| Pin box as the canvas edge (`die_anchor`)          | Area gap 0.50 -> 0.43, violations doubled, cost worse     |
+| Per-design canvas ratchet (`RATCHET`)              | Tighter canvases almost never feasible; 1.687 vs 1.663    |
+| Live frame, shrinks the canvas (`FRAME_UTIL=0.80`) | Area 0.25 -> 0.21, HPWL worse; retrained 1.582 vs 1.545   |
+| Large blocks first (`BIG_FRAC=0.4`) + frame        | Area 0.20, HPWL 0.55; retrained 1.647 vs 1.551            |
+| Same + HPWL weight x2 (`HPWL_WEIGHT=2`)            | Recovers some HPWL: 1.576 vs 1.545                        |
+| From-scratch retrain, frame, 20000 iterations      | All 40 checkpoints 1.579-1.634; best 1.580 vs 1.551       |
+| Whole-canvas U-Net position net (`POS_NET=unet`)   | 4000 iterations: 1.672 vs 1.528 for the current CNN       |
+| U-Net + analytic target map (`TARGET_MAP=1`)       | 4000 iterations: 1.706                                    |
+
+**What the experiments say about the policy:**
+
+- It has no lever on area. On a typical rollout the bounding box reaches
+  99% of its final size after 11% of the placements, and the final box
+  equals the canvas. The area term in the reward is zero for ~89% of the
+  decisions and its total is fixed by the canvas size, which is why
+  weighting it more did nothing. Every setup that took the canvas away as
+  a container (frame, die anchor, edge last, big-first) did shrink the
+  area, then lost more on wirelength and edge violations than it gained.
+  The slicing re-pack and the analytic placer get the area back after the
+  fact, so the policy's area matters less than it used to.
+- Raw-policy gains don't survive the solve stage. Greedy-rollout scores
+  improved from 1.862 to 1.816 over the 09-28 run while the full-pipeline
+  result stayed at 1.645-1.667. Pick checkpoints by the full pipeline only,
+  run more than once: run-to-run noise is about +-0.01 on 100 designs and
+  up to 0.5 on a single design.
+- Training stops paying off at about 4000 iterations. The 10-04 three-arm
+  test (fixed data seed, learning rate decayed 3e-4 -> 3e-5 within 4000
+  iterations) produced a 4000-iteration policy that beat the 12000-
+  iteration one (1.528 vs 1.551 without best-of; 1.424 vs 1.431 with it),
+  which is why it's installed. Continuing that run from 4000 (learning
+  rate restarted at 2.7e-4, stopped by a reboot at 14620) moved nothing:
+  training reward -2.8 to -3.2 throughout, 100-design greedy cost in a
+  1.81-1.93 band with no trend, anchor designs bouncing 1.55-1.67. The
+  10-03 from-scratch run looked the same.
+- The current position CNN is two 3x3 convolutions and a 1x1, so each
+  cell's score sees a 5x5-cell neighbourhood. The obvious fix, a
+  whole-canvas view, lost badly at 4000 iterations. It may need much
+  longer training, but given the plateau above that's not a cheap bet.
+
+Practical conclusion: more training of this network isn't worth the CPU
+time. Next work is in the solve stage -- a constraint-aware legalizer for
+the analytic candidates (edge pins and clusters handled exactly; vrel
+0.06 -> 0.03 target) and a compact packer (sequence pair / B*-tree on the
+contest cost; area gap 0.21 -> ~0.1 target). A policy idea that might
+still pay off: imitation, i.e. training the policy toward best-of layouts
+so one rollout lands nearer the best-of result.
+
+**Environment switches.** All are read at import time. Defaults are what
+the solver uses; the rest are experiment knobs left in for reproducibility.
+A checkpoint trained with `POS_NET`, `TARGET_MAP`, `FRAME_UTIL`, `BIG_*` or
+`EDGE_LAST` set needs the same settings when it's used.
+
+| Switch (`FLOORSET_...`) | Default          | What it does                                                   |
+|-------------------------|------------------|----------------------------------------------------------------|
+| `CHECKPOINT`            | `policy.pt`      | Checkpoint the solver loads                                    |
+| `CANDIDATES`            | base + 5 placers | Best-of candidates; empty = policy + polish only               |
+| `POLISH`                | `slice+repack`   | Polish without best-of: `slice+repack`, `repack`, `anneal`     |
+| `POS_NET`               | `cnn`            | Position network: `cnn` (5x5 view) or `unet` (whole canvas)    |
+| `TARGET_MAP`            | `0`              | Analytic-placer target as a second wiremask channel            |
+| `FRAME_UTIL`            | off              | Live frame utilization (e.g. 0.80); `FRAME_GROW`, `FRAME_SLIDE` |
+| `BIG_FRAC`              | `0`              | Share of blocks (by area) moved early in the ordering          |
+| `BIG_WEIGHT`            | `3`              | Strength of that move (x the boundary bonus)                   |
+| `BIG_MODE`              | `seed`           | `seed`, `connected` or `scale`                                 |
+| `EDGE_LAST`             | `0`              | Place edge-pinned blocks after the interior                    |
+| `KNOWN_DIMS`            | `0`              | Size the canvas from dimensions revealed by preplaced blocks   |
+| `HPWL_WEIGHT`           | `1.0`            | Training reward wirelength weight                              |
+| `AREA_WEIGHT`           | `1.0`            | Training reward area weight                                    |
+| `SLICE_REWARD`          | `0`              | Training reward on the slicing-packed layout (seconds budget)  |
+| `RATCHET`               | `0`              | Solve-time canvas tightening step after a feasible batch       |
+| `SNAP`                  | `reshape`        | Edge-snap mode in `repack.py`                                  |
+| `SLICE_MODES`           | `tree,shift`     | Slicing pre-modes (also `clamp`, `inplace`)                    |
+| `SLICE_NONEG`           | `0`              | Reject slicing candidates past the origin (worse; kept off)    |
+| `SLICE_PULLBACK`        | `0`              | Slicing pull-back variant (no net gain)                        |
+| `REPAIR`                | `0.3`            | Share of each polish budget for `legalize.repair`; 0 = off     |
+| `OUTLINE_WALLS`         | `0`              | Placer outline = true width/height from preplaced pins (worse) |
+| `LEGALIZER`             | `graph`          | Placer legalizer; `tetris` = experimental (worse)              |
+| `PACK`                  | `1.5`            | Packer seconds per candidate at 77 blocks (x (n/77)^2); 0 = off |
+| `PACK_TOPK`             | `4`              | Candidates packed                                              |
+| `PACK_TARGET`           | `0.5`            | Share of "move next to" steps aimed at a wired/cluster partner |
+| `PACK_BATCH`            | `32`             | Neighbours scored per packer step                              |
+| `PACK_T`                | `1.0`            | Packer start-temperature multiplier                            |
+| `PACK_EDGE`             | `0`              | Edge-thinning move share (worse)                               |
+| `PACK_WALL`             | `0`              | Search penalty past preplaced walls (no gain)                  |
+| `PROCS`                 | min(6, cpus)     | Worker processes for candidates and packer; 1 = in-process     |
+
+**Corrections to the 09-14 review above:** the position grid is 48x48 only in
+training; at solve time it's 32-96 cells by block count, and occupancy is
+tracked on a 4x finer grid. Every head now also gets the 6 step features
+alongside `progress`.
+
+## Solve stage, 10-05 to 10-06
+
+**Scoring note.** The official total isn't a plain average: each design is
+weighted by `exp(blocks / 12)` (README, "Scoring"), so the 116-120-block
+designs carry about a third of it. All results from here on are given as
+this weighted score too (`scripts/polish_bench.py` and
+`scripts/packer_bench.py` print it). Weighted: 9/28 report 1.619, 10/5
+report 1.466, 10/6 1.233 (official evaluator; 1.208 when the same solver
+ran sequentially -- run-to-run noise is about +-0.01-0.02).
+
+**Diagnosis first.** `scripts/bestof_diag.py` records every candidate's
+soft violations after every stage. On the 100 best-of winners of 10/5:
+112 edge violations (71 of them preplaced blocks -- they can't move, so
+they're off their edge whenever the layout sticks out past it), 100
+cluster and 44 grouped-shape (MIB) violations. The MIB ones were all made
+by `rl/slicing.py`, which gave a group's soft members a shape of their own
+instead of the fixed member's.
+
+**Repair (`rl/legalize.py`).** The ground-truth bbox starts at the origin,
+so pinned preplaced blocks reveal walls (left/bottom pin: x/y >= 0;
+right/top pin: the true width/height). `repair` moves every block past a
+wall into free holes inside the walls at once (one at a time can't help:
+the pin only counts once the last block is out) and reattaches cut-off
+cluster members beside their cluster's largest component, keeping a move
+only if the contest cost drops. With the MIB fix: 1.424 -> 1.354 (mean).
+The preplaced-wall violations mostly remain: the constraint-graph
+legalizer resolves overlaps by pushing blocks outward, past the wall
+(design 2: slicing root exactly 102 wide = the wall, legalized 105-118).
+Tried and dropped: a pair-relation bias toward stacking (fits the width by
+growing much taller), stacking past-wall blocks on top (new violations), a
+Tetris legalizer for the placer (tighter but worse wirelength: 1.432 vs
+1.368), the true outline in the placer (1.362 vs 1.354).
+
+**Compact packer (`rl/packer.py`).** A sequence pair (G+, G-) represents
+any packing: a before b in both -> a left of b; after in G+ but before in
+G- -> a below b. The start comes from the layout itself: G- orders pairs
+that are left-of with overlapping y-ranges, below with overlapping
+x-ranges, or fully lower-left; G+ the same with above/upper-left. Every
+relation it implies is true of the layout, so packing it reproduces the
+layout or something smaller (100/100 designs). Picking one relation per
+pair by the larger gap -- the obvious way -- makes the orders cyclic and
+scrambled 80/100 starts. Packing is the longest path in G- order: the
+blocks before position k are k's only possible predecessors, left of it if
+also earlier in G+, else below it. Preplaced blocks keep their spot (a
+conflict makes that sequence pair infeasible); right/top-pinned blocks
+with nothing beyond them slide out to the edge. numpy has no fast per-SP
+loop, so each step scores 32 neighbours together ([batch, n] arrays) and
+takes the best under an annealing rule. Moves: swaps in one or both
+sequences, reshaping a soft unit (MIB groups together), and "move a next
+to b" (half the time b is a wired or cluster partner of a). The fast cost
+is the contest formula relative to the start layout with exact boundary
+and grouping counts; the result is re-checked with the real evaluator and
+returned only if better.
+
+Results (mean of 100 designs unless marked weighted):
+
+| Change                                             | Result                                 |
+|----------------------------------------------------|----------------------------------------|
+| Packer on the best-of winner, 1.5 s                | 1.354 -> 1.267                         |
+| Pack the best 3 candidates x 1.5 s                 | 1.238 (best one x 4.5 s: 1.253 cached) |
+| 6 candidates (placer utilization 0.75-1.0), best 4 | 1.205; weighted 1.252                  |
+| Packer time x (n/77)^2 instead of flat             | weighted 1.250 -> 1.229 (cached)       |
+| Placer 600 iterations instead of 250               | weighted 1.233 -> 1.226 (cached)       |
+| Parallel worker processes                          | same quality, 23 s -> 7.8 s            |
+
+Not helpful: batch 16/64, start temperature x0.1/x10, an edge-thinning
+move, a search penalty for layouts past the preplaced walls (the true
+outline has ~3% white space; pulling into it costs more wirelength than it
+saves), nine candidates instead of six (1.205 vs 1.207, +3 s), unpolished
+candidates (1.337 vs 1.248), half the polish (1.262 vs 1.248).
+
+**Parallel workers.** `my_optimizer.py` keeps a forkserver pool for the
+candidate builds and packer runs. Pool functions must live in `rl/`: the
+contest evaluator imports `my_optimizer.py` under another module name, so
+anything defined there can't be pickled (the first attempt failed every
+design this way). Any pool failure falls back to running in-process. Each
+stage has a wall-clock budget, so parallel processes do less work each (on
+this laptop's 4 performance + 4 efficiency cores the packer makes 1113
+steps in 3 s alone, ~955 with 4 at once, ~520 with 6), but on the 12
+largest designs parallel (1.230-1.234) and sequential (1.218-1.238) runs
+are within noise, and doubling the budgets in parallel didn't help either.
+
+**Where it stands (10-06).** Weighted 1.233, mean 1.212, HPWL gap 0.17,
+area gap 0.15, vrel 0.02, all feasible, 7.8 s per design. The largest
+designs are still the worst (mean 1.24 for 100+ blocks) and weigh the
+most; 30 s of packer time only gains 0.02-0.08 on them, so the next gain
+needs better moves (aimed at specific violations and critical paths) or a
+packer that builds inside the preplaced walls, not more time. The runtime
+factor is unknown until the official run: if the field is much faster,
+`FLOORSET_PACK` and the candidate count are the knobs.
+
+## Preplaced walls and wirelength relaxation, 10-06
+
+**Where the remaining cost is.** On the official 10-06 run the weighted
+excess over ground truth (0.233) splits into HPWL 0.094, area 0.084 and
+violations 0.055. The violations left are 60 preplaced blocks off their
+edge, 21 movable blocks off their edge, 17 cluster breaks, no MIB.
+Pinned preplaced blocks reveal walls of the true outline. Nine designs
+reveal both width and height (12, 31, 53, 57, 61, 69, 88, 89, 99: 16% of
+the weight, a quarter of the excess) and our layouts overshoot them; 28
+more reveal one side and overshoot it.
+
+**Why fitting the outline is hard.** Block area divided by the true
+outline is 0.96-1.006 on those nine designs: the ground truth has 0-4%
+white space (our layouts ~15%). What was tried, all on the official
+layouts:
+
+| Attempt                                                       | Result                                                     |
+|---------------------------------------------------------------|------------------------------------------------------------|
+| Slicing at the true outline, then `rl/repack._legalize`       | raw overlap only 2-8%, but the legalizer blows it up (88: ~300 x 600) |
+| Slicing leaves -> sequence pair -> bottom-left pack           | feasible on 12 and 57 only (12: 1.296 -> 1.151 with 5 s packer); hard blocks overflow their slices and hit preplaced blocks on the rest |
+| + slack-based reshaping of soft blocks on the critical path    | stalls: both axes over the outline, nothing left to trade  |
+| + continuous optimizer (torch: x, y, aspect under the sequence pair, outline penalty) | can't satisfy overlap and outline together at ~1% white space |
+| Packer with a wall penalty (x5, x50) for 15 s                 | still 15-20% past the outline, cost not better             |
+
+Exact fitting needs either a much better arrangement than the slicing /
+packer starts give or a real fixed-outline floorplanner; none of the
+prototypes went into the solver.
+
+**Wirelength relaxation (`rl/packer.py relax_hpwl`, default on).** The
+packer's bottom-left packing puts every block at the low end of its slack.
+`relax_hpwl` keeps the final layout's sequence pair and bbox and moves each
+block, one axis at a time, to the weighted median of what it connects to
+(the exact optimum on that axis with everything else fixed), clamped to
+its slack window. Preplaced, edge-pinned (on their axis) and cluster blocks
+stay put, so no violation can appear; the result is kept only if the
+contest cost drops. On the 100 official 10-06 layouts: weighted 1.2335 ->
+1.2308, 98/100 designs better, ~46 ms per design. Letting cluster members
+move too: 1.2320 (cluster breaks cost more than the wirelength gained).
+
+Official evaluator with the relaxation (`official_eval_1006b.json`):
+weighted 1.2250, mean 1.2008, HPWL gap 0.151, area gap 0.146, vrel 0.021,
+100/100 feasible, 7.2 s average, 15.1 s max (morning run without it:
+1.2335 / 1.212 / 7.8 s; the gap beyond the 0.003 measured on fixed layouts
+is run-to-run noise). Anchors, median of 3 (`results_report_1006b`): 0
+1.370, 49 1.315, 98 1.129.
+
+**Origin rule (`FLOORSET_ORIGIN=1`, off by default).** 78 of 100 official
+layouts had blocks below / left of (0, 0), outside the box the pins sit on
+(designs 0 and 49 in the report). The policy never does it; the placer's
+`_legalize_grow` and the slicing re-pack lower the floor when blocks don't
+fit in front of a preplaced block. The switch forbids it everywhere
+(placer legalizer without floor lowering, slicing NONEG, best-of ranks
+overhanging candidates last, packer packs from the origin). All 100 layouts
+stay in the box, but the official score drops 1.2250 -> 1.2653
+(`official_eval_1006c_origin.json`): 73 designs worse, mostly 100+ blocks
+(design 94 HPWL gap 0.18 -> 0.39). Repacking finished layouts from the
+origin is worse still (1.2478, 34 never fit).
+
+**Leaderboard (10-06, `leaderboard_1006.csv`), sorted by cost.** On raw
+score (weighted cost before the runtime factor) our 1.225 places 6th of 11,
+0.141 behind the best entry (1.084). The leaders are also faster (0.1-1.3 s
+per design vs our 7.2 s); the pipeline can be sped up, but the focus is
+quality: closing the cost gap.
+
+## Big designs and the bounding box, 10-07
+
+Quality over runtime (user, 10-06/07). The 21 designs with 100+ blocks are
+83% of the weighted score.
+
+| Change (official evaluator unless noted)                  | Weighted | Area gap | Time per design |
+|-----------------------------------------------------------|----------|----------|-----------------|
+| 10-06 solver                                              | 1.2250   | 0.146    | 7 s             |
+| Packer x27 (`FLOORSET_PACK=40`) + squeeze                 | 1.1352   | 0.086    | 45 s            |
+| + origin repair (`FLOORSET_ORIGIN`, default on)           | 1.1318   | 0.079    | 45 s            |
+
+Big-design bench (`scripts/big_bench.sh`, weighted total with the rest from
+the 10-06 run): packer 1.5 / 6 / 15 / 40+squeeze -> 1.225 / 1.192 / 1.170 /
+1.147, still improving. Packing all six candidates at once is worse (CPU
+contention on 4P+4LP cores). Packer speed-ups (merged nets, pin nets via
+sorted prefix sums, blocks x batch layout) give 1.8x steps on design 99 but
+no measurable score change.
+
+`squeeze` (rl/packer.py): keeps the sequence pair; soft units on the
+height-critical path are widened into their x-slack (vice versa for width),
+all variants packed exactly, best kept while the cost drops.
+
+`_origin_repair` (rl/packer.py): when a start overhangs (x or y < 0), pack
+from the origin; blocks that run into a preplaced block they are left of /
+below are moved to another side of it (or next to a random block when
+stuck), until nothing conflicts (81/81 official layouts). The search then
+stays inside, and my_optimizer prefers in-box results. Official: 0/100
+layouts below/left of the origin (was 81).
+
+**Pin box (top / right edges).** The pins sit on the true outline, so no
+block of the ground truth ends past the pins' highest x / y; 52/100 of our
+layouts did (up to 24%), mostly from a wrong overall shape (design 80: 172 x
+178 against a 139 x 240 box; blocks fill only 69-93% of the pin box, so
+there is room). Changes, default on: `rl/slicing.py` also tries roots with
+the pin box's aspect (`FLOORSET_SLICE_PINASPECT`), `rl/packer.py` penalizes
+running past the box (`FLOORSET_PINBOX=3`, per sqrt(area)), tracks the best
+in-box layout first and prefers in-box results, and `my_optimizer.py` picks
+in-box layouts first. Neither the penalty nor a box-aware `squeeze` alone
+fixes an already-packed layout (the right-pinned column would have to move
+together; width-critical paths run through preplaced blocks).
+
+| Official, 100 designs        | Weighted | HPWL gap | Area gap | vrel  | Outside pin box |
+|------------------------------|----------|----------|----------|-------|-----------------|
+| Origin repair only           | 1.1318   | 0.105    | 0.079    | 0.014 | 52              |
+| + pin box (default)          | 1.1482   | 0.121    | 0.068    | 0.020 | 8 (1-10%)       |
+
+Kept as default by the user's choice (layout inside the box over the last
+0.016 of score). Penalty 10 fits 2 more of the last 7 but costs much more
+(design 4: 1.315 -> 1.536).
+
+## Shape fitting, learned placer, packer 100 -- 10-07 / 10-08
+
+**The ground truth scores 1.108 weighted** on the contest evaluator (219
+edge-pin and 10 cluster violations over 100 designs; only its wirelength and
+area define 1.0). The packer started from the exact ground truth reaches
+1.016, so the optimizer is good enough; the ground truth's arrangement with
+soft shapes off by ~20% only reached ~1.24 with the packer alone.
+
+**A -- `rl/sizing.py fit_shapes`.** Keeps a sequence pair and optimizes every
+soft unit's log aspect (MIB groups share one) by Adam on a differentiable
+packing (longest paths over the left-of / below relations, preplaced fixed),
+loss = contest quality term + edge-pin + preplaced-collision + cluster-gap
+penalties; snapshots are packed exactly (`_Batch.pack`) and scored with the
+real evaluator. GT arrangement + shapes x exp(N(0, 0.2)) -> fit (1000 steps,
+lr 0.02) -> packer 6 -> squeeze -> relax: **1.048 weighted, 100/100 feasible**
+(`gt_bound_shape0.2_fit.json`, `scripts/gt_arrangement_bound.py FIT=1`).
+
+**B -- `rl/learned_placer.py`.** PlacerNet = NetlistEncoder (15 block
+features incl. preplaced centres and sizes in pin-box units; edge weights
+mean-normalized; 6 layers x 128) + MLP head -> block centre in [0, 1]^2 of
+the pin box and log aspect (bounded to 1/8..8). Trained on the training
+set's ground truth (`fp_sol` = w, h, x, y) with L1 losses
+(`scripts/train_placer.py`, ~1,900 designs/min on 2 threads; val centre L1
+0.92 -> 0.061 in 7 h). `to_layout`: sequence pair from the predicted centres
+(G+ by x - y, G- by x + y), predicted shapes, packed from the origin;
+`rl/analytic.py learned_candidate` resolves preplaced collisions (fit_shapes,
+else `_origin_repair`) and fits shapes. Default best-of candidate `learned`,
+always packed (`best_of(force=...)`). Placer checkpoint: `FLOORSET_PLACER`
+(default `checkpoints/placer.pt`).
+
+| Official, 100 designs                | Weighted | HPWL gap | Area gap | vrel  |
+|--------------------------------------|----------|----------|----------|-------|
+| 10/7, in-box within 5%, packer 40    | 1.1358   | 0.116    | 0.068    | 0.017 |
+| C: packer 100                        | 1.1232   | 0.110    | 0.062    | 0.018 |
+| B: + learned candidate (snapshot)    | 1.1027   | 0.076    | 0.056    | 0.015 |
+| + second checkpoint ("learned2")     | 1.0924   | 0.058    | 0.055    | 0.014 |
+| + second training run ("learned3")   | 1.0795   | 0.041    | 0.055    | 0.015 |
+
+Ground truth as scored 1.108; leaderboard leader 1.084.
+
+Two checkpoints of one training run (placer_a.pt at ~290k designs, val
+0.067; placer_b.pt at 910k, val 0.060) make different mistakes: alone ~1.21
+each with packer 6, the better of the two per design 1.164; the final one
+alone is not better than the snapshot. Both are candidates (`learned`,
+`learned2`, env `FLOORSET_PLACER` / `FLOORSET_PLACER2`), both always packed.
+
+
+## Honest rewards, block relations -- 10-09
+
+**Reward alignment** (`scripts/reward_alignment.py`, 34 designs x 8 sampled
+arrangements of placer_d, centre noise 0.02 / aspect 0.2): within-design rank
+correlation with the true final cost (fit 1000 + packer 6 + squeeze + relax):
+raw repaired layout 0.38, + fit 200 0.43, + fit 200 + 1 s packer 0.54 (pick
+regret 0.029 vs 0.098 for the plain prediction; best of 8 beats the prediction
+on 26/34). The 10/8 RL fine-tune (`scripts/rl_placer.py`, raw reward) failed
+for that reason. Sample-and-rank in the solver (`FLOORSET_PLACER_SAMPLES`,
+default 1 = off): official 1.0801 vs 1.0815 -- noise; the packer at budget 100
+evens out variants of one arrangement.
+
+**Larger placer** (256 x 8): stalled (outputs saturated) until
+`NetlistEncoder(norm=True)`: messages divided by (edge-weight sum + 1) and
+LayerNorm per layer (`placer_d.pt`, val centre L1 0.052).
+
+**Relation head** (`PlacerNet(rel=True)`): for block pairs (i, j) an MLP on
+[hi + hj, hi - hj, hi * hj] -> {i left of j, j left of i, i below j, j below
+i}, labels from the ground truth's sequence pair (2048 sampled pairs per
+design, weight 0.5); `rel_sequences` ranks blocks by their summed probability
+of coming first in G+ / G- -> sequence pair. Trained from placer_d
+(`train_placer.py --norm --rel --resume`): val relation accuracy 0.906 after
+~50k designs; centre predictions also improved (packer-6 test 1.185 -> 1.167).
+Arrangement from relations 1.159 (better on 100+ blocks), from centres 1.167
+(better on smaller designs) -> both are candidates (`PLACER_FILES` entries
+`(file, use_rel)`).
+
+| Official, 100 designs                              | Weighted | HPWL gap | Area gap |
+|----------------------------------------------------|----------|----------|----------|
+| three placers (10/8 report)                        | 1.0795   | 0.041    | 0.055    |
+| + refit / larger network / sample-and-rank (runs)  | 1.080-1.082 | 0.040 | 0.051-0.055 |
+| placer A + relation net (relations, centres)       | 1.0727   | 0.034    | 0.054    |
+| same, relation net trained to 312k designs (10-10) | 1.0575   | 0.032    | 0.044    |
+
+## More search and a second relation network, 10-11
+
+| Official, 100 designs                                     | Weighted | HPWL gap | Area gap | Beats GT |
+|-----------------------------------------------------------|----------|----------|----------|----------|
+| 10-10 default (packer 100)                                | 1.0575   | 0.032    | 0.044    | 66       |
+| relation net trained on to 358k designs (`placer_rel3`)   | 1.0709   | 0.029    | 0.047    | 66       |
+| 10-10 + second relation net (`placer_relB`) as learned4   | 1.0596   | 0.026    | 0.048    | 69       |
+| same + packer budget 200 (new default)                    | 1.0465   | 0.022    | 0.036    | 72       |
+
+Longer training lowered validation error (0.050 -> 0.049) but not the
+official score: validation error doesn't track the final cost. Run-to-run
+variation is large (best of three runs per design: 1.046 at packer 100),
+so more search pays; runtime 110 -> 209 s per design. The pin box tightened
+to right/top-pinned preplaced edges (`FLOORSET_WALLBOX`, the true outline;
+40 of the 58 remaining violations are such blocks just past it) was neutral
+on 12 large designs and stays off.

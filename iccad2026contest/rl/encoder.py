@@ -50,9 +50,14 @@ def build_pin_features(instance, canvas_scale: float) -> torch.Tensor:
 
 class NetlistEncoder(nn.Module):
     def __init__(self, hidden_dim: int = 64, num_layers: int = 3,
-                 block_feat_dim: int = BLOCK_FEAT_DIM, pin_feat_dim: int = PIN_FEAT_DIM):
+                 block_feat_dim: int = BLOCK_FEAT_DIM, pin_feat_dim: int = PIN_FEAT_DIM,
+                 norm: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
+        # norm (10-08): messages averaged by total edge weight + LayerNorm per layer;
+        # without it, deep/wide encoders blew up and the placer's outputs saturated.
+        self.norm = norm
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)]) if norm else None
         self.block_embed = nn.Linear(block_feat_dim, hidden_dim)
         self.pin_embed = nn.Linear(pin_feat_dim, hidden_dim)
         self.layers = nn.ModuleList([
@@ -79,15 +84,17 @@ class NetlistEncoder(nn.Module):
         b2b_valid = b2b_edges[b2b_edges[:, 0] >= 0] if b2b_edges.numel() > 0 else b2b_edges
         p2b_valid = p2b_edges[p2b_edges[:, 0] >= 0] if p > 0 and p2b_edges.numel() > 0 else p2b_edges[:0]
 
-        for layer in self.layers:
+        for li, layer in enumerate(self.layers):
             h_all = torch.cat([h_block, h_pin], dim=0) if p > 0 else h_block
             agg = torch.zeros_like(h_all)
+            wsum = torch.zeros(h_all.shape[0], dtype=h_all.dtype)
 
             def add_messages(src_idx, dst_idx, weight):
                 if src_idx.numel() == 0:
                     return
                 msg = h_all[src_idx] * weight.unsqueeze(-1)
                 agg.index_add_(0, dst_idx, msg)
+                wsum.index_add_(0, dst_idx, weight.to(h_all.dtype))
 
             if b2b_valid.numel() > 0:
                 i, j, w = b2b_valid[:, 0].long(), b2b_valid[:, 1].long(), b2b_valid[:, 2]
@@ -101,7 +108,11 @@ class NetlistEncoder(nn.Module):
                 add_messages(pin_i, blk_j, w)
                 add_messages(blk_j, pin_i, w)
 
-            h_all = layer(torch.cat([h_all, agg], dim=-1)) + h_all
+            if self.norm:
+                agg = agg / (wsum.unsqueeze(-1) + 1.0)
+                h_all = self.norms[li](layer(torch.cat([h_all, agg], dim=-1)) + h_all)
+            else:
+                h_all = layer(torch.cat([h_all, agg], dim=-1)) + h_all
             h_block = h_all[:n]
             h_pin = h_all[n:] if p > 0 else h_pin
 
