@@ -16,6 +16,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 W, H = 8.5, 11            # portrait letter
 LEFT, TOP, BOTTOM = 0.08, 0.95, 0.055
 REPO = "git@github.com:andyfox-rushc/FloorSet.git"
+BRANCH = "experiment1---(Claude-generated-version-of-Goldie-work)"   # main is Intel upstream only
 
 # Document content: (kind, ...) blocks laid out top to bottom with page breaks.
 #   ("h1", text) ("h2", text) ("p", text) ("code", [lines]) ("table", header, rows, widths) ("page",)
@@ -40,12 +41,14 @@ DOC = [
           "every trained model was produced."),
 
     ("h1", "1. Get the code"),
-    ("code", [f"git clone {REPO}",
+    ("code", [f"git clone -b '{BRANCH}' \\",
+              f"    {REPO}",
               "cd FloorSet",
               "# all solver commands below run from FloorSet/iccad2026contest"]),
     ("p", "The repository is a fork of Intel's FloorSet repository. The top level holds Intel's "
           "dataset loaders and the 100 validation designs (LiteTensorDataTest/); our solver lives "
-          "in iccad2026contest/ next to the contest evaluator."),
+          "in iccad2026contest/ next to the contest evaluator. The solver is on the branch above "
+          "only: the default branch (main) is Intel's code without it."),
 
     ("h1", "2. Install"),
     ("p", "No compilation step: everything is Python. Tested with Python 3.14.4 and the versions "
