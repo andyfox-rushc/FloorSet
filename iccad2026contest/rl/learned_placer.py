@@ -25,6 +25,8 @@ import torch.nn as nn
 from .encoder import NetlistEncoder, build_block_features
 
 FEAT_DIM = 15
+LAYOUT_DIM = 4          # repair net (10-16): current centre and size of each block, pin-box units
+GEOM_DIM = 8            # per pair: current relation one-hot, centre offset, signed gaps (pin-box units)
 REL_W = 0.5             # weight of the pairwise relation loss
 Position = Tuple[float, float, float, float]
 
@@ -38,8 +40,9 @@ def pin_box_of(instance) -> Tuple[float, float]:
     return max(float(v[:, 0].max()), 1e-3), max(float(v[:, 1].max()), 1e-3)
 
 
-def features(instance):
-    """(block feats [n, 15], pin feats [p, 2], b2b, p2b with mean-normalized weights, (PX, PY))."""
+def features(instance, layout=None):
+    """(block feats [n, 15], pin feats [p, 2], b2b, p2b with mean-normalized weights, (PX, PY)).
+    `layout` (positions) appends each block's current centre and size: the repair net's input."""
     n = instance.block_count
     PX, PY = pin_box_of(instance)
     base = build_block_features(instance, 1.0)
@@ -54,6 +57,10 @@ def features(instance):
         known * tp[:, 2].clamp(min=0) / PX, known * tp[:, 3].clamp(min=0) / PY,
     ], dim=1)
     feats = torch.cat([base.float(), extra], dim=1)
+    if layout is not None:
+        q = torch.tensor([list(map(float, r[:4])) for r in layout[:n]])
+        feats = torch.cat([feats, torch.stack([(q[:, 0] + q[:, 2] / 2) / PX, (q[:, 1] + q[:, 3] / 2) / PY,
+                                               q[:, 2] / PX, q[:, 3] / PY], dim=1)], dim=1)
     pins = instance.pins_pos.float() if instance.pins_pos is not None else torch.zeros(0, 2)
     pin_feats = pins / torch.tensor([PX, PY])
 
@@ -68,20 +75,30 @@ def features(instance):
 
 
 class PlacerNet(nn.Module):
-    def __init__(self, hidden: int = 128, layers: int = 6, norm: bool = False, rel: bool = False):
+    def __init__(self, hidden: int = 128, layers: int = 6, norm: bool = False, rel: bool = False,
+                 layout: bool = False, rel_geom: bool = False):
         super().__init__()
-        self.encoder = NetlistEncoder(hidden_dim=hidden, num_layers=layers, block_feat_dim=FEAT_DIM, norm=norm)
+        # layout (10-16): repair net, reads a current layout too (features(..., layout))
+        self.layout = layout
+        self.encoder = NetlistEncoder(hidden_dim=hidden, num_layers=layers,
+                                      block_feat_dim=FEAT_DIM + (LAYOUT_DIM if layout else 0), norm=norm)
         self.head = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(), nn.Linear(hidden, 3))
         # rel (10-09): pairwise arrangement head -- for a pair (i, j): i left of j,
         # j left of i, i below j, j below i (the four sequence-pair relations)
         self.rel = rel
-        self.rel_head = (nn.Sequential(nn.Linear(3 * hidden, hidden), nn.ReLU(), nn.Linear(hidden, 4))
-                         if rel else None)
+        # rel_geom (10-16): the pair's geometry in the input layout also feeds the relation
+        # head, so keeping a correct input relation is easy to learn
+        self.rel_geom = rel_geom
+        self.rel_head = (nn.Sequential(nn.Linear(3 * hidden + (GEOM_DIM if rel_geom else 0), hidden), nn.ReLU(),
+                                       nn.Linear(hidden, 4)) if rel else None)
+        self.geom_skip = nn.Linear(GEOM_DIM, 4) if rel_geom else None
         self._h = None
 
-    def rel_logits(self, h, i, j):
+    def rel_logits(self, h, i, j, geom=None):
         hi, hj = h[i], h[j]
-        return self.rel_head(torch.cat([hi + hj, (hi - hj), hi * hj], dim=1))
+        if not self.rel_geom:
+            return self.rel_head(torch.cat([hi + hj, (hi - hj), hi * hj], dim=1))
+        return self.rel_head(torch.cat([hi + hj, (hi - hj), hi * hj, geom], dim=1)) + self.geom_skip(geom)
 
     def forward(self, feats, pin_feats, b2b, p2b):
         h, _ = self.encoder(feats, pin_feats, b2b, p2b)
@@ -114,6 +131,24 @@ def gt_relations(instance, fp_sol):
     return rp, rm
 
 
+def pair_geom(instance, layout, i, j):
+    """[pairs, GEOM_DIM] geometry of pairs (i, j) in `layout` (see GEOM_DIM)."""
+    from .packer import sequence_pair
+    n = instance.block_count
+    PX, PY = pin_box_of(instance)
+    q = np.array([list(map(float, r[:4])) for r in layout[:n]])
+    x, y, w, h = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    gp, gm = sequence_pair(x, y, w, h)
+    rp, rm = np.empty(n, int), np.empty(n, int)
+    rp[gp], rm[gm] = np.arange(n), np.arange(n)
+    one = np.eye(4)[rel_labels(rp, rm, i, j)]
+    cx, cy = x + w / 2, y + h / 2
+    gx = np.maximum(x[j] - (x[i] + w[i]), x[i] - (x[j] + w[j]))     # > 0: apart horizontally
+    gy = np.maximum(y[j] - (y[i] + h[i]), y[i] - (y[j] + h[j]))
+    g = np.concatenate([one, np.stack([(cx[j] - cx[i]) / PX, (cy[j] - cy[i]) / PY, gx / PX, gy / PY], 1)], 1)
+    return torch.tensor(g, dtype=torch.float32)
+
+
 def rel_labels(rp, rm, i, j):
     """Class per pair: 0 i left of j, 1 j left of i, 2 i below j, 3 j below i."""
     left_ij = (rp[i] < rp[j]) & (rm[i] < rm[j])
@@ -125,8 +160,8 @@ def rel_labels(rp, rm, i, j):
 REL_PAIRS = 2048        # pairs sampled per design for the relation loss
 
 
-def loss_fn(net, instance, fp_sol):
-    feats, pin_feats, b2b, p2b, _ = features(instance)
+def loss_fn(net, instance, fp_sol, layout=None):
+    feats, pin_feats, b2b, p2b, _ = features(instance, layout)
     c_pred, a_pred = net(feats, pin_feats, b2b, p2b)
     c_true, a_true = targets(instance, fp_sol)
     con = instance.constraints[:instance.block_count]
@@ -143,18 +178,19 @@ def loss_fn(net, instance, fp_sol):
             k = np.random.choice(len(iu), REL_PAIRS, replace=False)
             iu, ju = iu[k], ju[k]
         lab = torch.tensor(rel_labels(rp, rm, iu, ju))
-        logits = net.rel_logits(net._h, torch.tensor(iu), torch.tensor(ju))
+        geom = pair_geom(instance, layout, iu, ju) if getattr(net, "rel_geom", False) else None
+        logits = net.rel_logits(net._h, torch.tensor(iu), torch.tensor(ju), geom)
         lr_ = nn.functional.cross_entropy(logits, lab)
         loss = loss + REL_W * lr_
         net._last_rel = (float(lr_.detach()), float((logits.argmax(1) == lab).float().mean()))
     return loss, float(lc.detach()), float(la.detach())
 
 
-def predict(net, instance, noise: float = 0.0, aspect_noise: float = 0.0, rng=None):
+def predict(net, instance, noise: float = 0.0, aspect_noise: float = 0.0, rng=None, layout=None):
     """Centres (absolute) and log aspects; optional Gaussian noise (centres in
     pin-box units, aspects in log units) turns the placer into a sampler."""
     with torch.no_grad():
-        feats, pin_feats, b2b, p2b, (PX, PY) = features(instance)
+        feats, pin_feats, b2b, p2b, (PX, PY) = features(instance, layout)
         c, a = net(feats, pin_feats, b2b, p2b)
     c, a = c.numpy().copy(), a.numpy().copy()
     if noise > 0 or aspect_noise > 0:
@@ -164,16 +200,17 @@ def predict(net, instance, noise: float = 0.0, aspect_noise: float = 0.0, rng=No
     return c[:, 0] * PX, c[:, 1] * PY, a
 
 
-def rel_sequences(net, instance):
+def rel_sequences(net, instance, layout=None):
     """Sequence pair from the pairwise relation head: rank blocks by their total
     probability of coming first in G+ (left of, or above, the other block) and in
     G- (left of, or below)."""
     n = instance.block_count
     with torch.no_grad():
-        feats, pin_feats, b2b, p2b, _ = features(instance)
+        feats, pin_feats, b2b, p2b, _ = features(instance, layout)
         net(feats, pin_feats, b2b, p2b)
         iu, ju = np.triu_indices(n, 1)
-        pr = torch.softmax(net.rel_logits(net._h, torch.tensor(iu), torch.tensor(ju)), dim=1).numpy()
+        geom = pair_geom(instance, layout, iu, ju) if getattr(net, "rel_geom", False) else None
+        pr = torch.softmax(net.rel_logits(net._h, torch.tensor(iu), torch.tensor(ju), geom), dim=1).numpy()
     # classes: 0 i left j, 1 j left i, 2 i below j, 3 j below i
     before_p = pr[:, 0] + pr[:, 3]        # i before j in G+ (i left of j, or i above j)
     before_m = pr[:, 0] + pr[:, 2]        # i before j in G- (i left of j, or i below j)
@@ -184,19 +221,21 @@ def rel_sequences(net, instance):
 
 
 def to_layout(instance, net, noise: float = 0.0, aspect_noise: float = 0.0, rng=None, pred=None,
-              use_rel: Optional[bool] = None):
+              use_rel: Optional[bool] = None, seqs=None, layout=None):
     """Predicted (or sampled) arrangement packed from the origin:
-    (positions, (gp, gm), collision overshoot)."""
+    (positions, (gp, gm), collision overshoot). `seqs` = (gp, gm) given
+    (e.g. sampled by scripts/rl_relation.py) instead of predicted."""
     from . import packer as K
     from . import repack as R
     n = instance.block_count
-    cx, cy, la = pred if pred is not None else predict(net, instance, noise, aspect_noise, rng)
+    cx, cy, la = pred if pred is not None else predict(net, instance, noise, aspect_noise, rng, layout)
     con = instance.constraints[:n]
     tp = instance.target_positions[:n].numpy().astype(float)
     area = instance.area_targets[:n].numpy().astype(float)
     fixed = (con[:, 0] != 0).numpy()
     pre = (con[:, 1] != 0).numpy() if con.shape[1] > 1 else np.zeros(n, bool)
-    asp = np.exp(np.clip(la, -math.log(8), math.log(8)))
+    from .repack import MAX_ASPECT
+    asp = np.exp(np.clip(la, -math.log(MAX_ASPECT), math.log(MAX_ASPECT)))
     w = np.where(fixed | pre, tp[:, 2], np.sqrt(area * asp))
     h = np.where(fixed | pre, tp[:, 3], area / np.maximum(w, 1e-9))
     mib = con[:, 2].numpy() if con.shape[1] > 2 else np.zeros(n)
@@ -214,8 +253,10 @@ def to_layout(instance, net, noise: float = 0.0, aspect_noise: float = 0.0, rng=
     if use_rel is None:     # env FLOORSET_USE_REL=0 builds the arrangement from centres even with a relation head
         import os
         use_rel = os.environ.get("FLOORSET_USE_REL", "1") != "0"
-    if use_rel and getattr(net, "rel", False) and n > 1:
-        gp, gm = rel_sequences(net, instance)
+    if seqs is not None:
+        gp, gm = (np.asarray(q) for q in seqs)
+    elif use_rel and getattr(net, "rel", False) and n > 1:
+        gp, gm = rel_sequences(net, instance, layout)
     else:
         gp = np.argsort(cx - cy, kind="stable")
         gm = np.argsort(cx + cy, kind="stable")

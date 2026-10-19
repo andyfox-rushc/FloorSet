@@ -25,7 +25,7 @@ from iccad2026_evaluate import ContestEvaluator, evaluate_solution
 from rl.anneal import anneal_polish
 from rl.data import from_solve_args
 from rl.finetune import finetune_and_solve
-from rl.networks import ActorCritic
+from rl.networks import ActorCritic, load_state
 
 DEV_SET = list(range(20))
 ANCHOR_CASES = [0, 49, 98]
@@ -50,13 +50,13 @@ def _build_instance(evaluator, tid):
     return instance, baseline, target_pos, (area_target, b2b_conn, p2b_conn, pins_pos, constraints)
 
 
-def solve_one(net, evaluator, tid, time_budget, anneal_budget, seed):
+def solve_one(net, evaluator, tid, time_budget, anneal_budget, seed, utilizations=None):
     instance, baseline, target_pos, raw = _build_instance(evaluator, tid)
     area_target, b2b_conn, p2b_conn, pins_pos, constraints = raw
     torch.manual_seed(seed)
     positions, _ = finetune_and_solve(instance, net=net, time_budget=time_budget,
                                        max_iterations=150, episodes_per_iter=6, ppo_epochs=3,
-                                       seed=seed, verbose=False)
+                                       seed=seed, verbose=False, utilizations=utilizations)
     positions = anneal_polish(instance, positions, time_budget=anneal_budget, seed=seed)
     m = evaluate_solution({"positions": positions, "runtime": 0.0}, baseline, constraints,
                            b2b_conn, p2b_conn, pins_pos, area_target, target_pos, median_runtime=1.0)
@@ -79,7 +79,7 @@ def main():
     evaluator._load_dataset()
     net = ActorCritic()
     if Path(args.checkpoint).exists():
-        net.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+        load_state(net, args.checkpoint)
         print(f"loaded checkpoint: {args.checkpoint}")
     else:
         print(f"WARNING: checkpoint {args.checkpoint} not found, evaluating an untrained policy")

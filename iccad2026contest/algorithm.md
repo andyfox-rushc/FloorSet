@@ -1061,3 +1061,131 @@ so more search pays; runtime 110 -> 209 s per design. The pin box tightened
 to right/top-pinned preplaced edges (`FLOORSET_WALLBOX`, the true outline;
 40 of the 58 remaining violations are such blocks just past it) was neutral
 on 12 large designs and stays off.
+
+## Aspect cap 16 and the cluster fix, 10-12 to 10-16
+
+| Official, 100 designs                                     | Weighted | HPWL gap | Area gap | Beats GT |
+|-----------------------------------------------------------|----------|----------|----------|----------|
+| 10-11 default (packer 200, aspect cap 8)                  | 1.0465   | 0.022    | 0.036    | 72       |
+| soft blocks up to 16:1 (`FLOORSET_MAX_ASPECT=16`)         | 1.0451   | 0.022    | 0.031    | 68       |
+| + cluster repair + cluster-gap penalty 1 (new default)    | 1.0432   | 0.017    | 0.035    | 72       |
+
+The 68 vs 72 at cap 16 is run-to-run noise (designs flip both ways). More
+packer restarts on designs 90-99 (6 or 12 runs, or twice the time per run)
+were all within the ~0.01 noise and stay off (`FLOORSET_PACK_JOBS=0`).
+
+Cluster fix. At cap 16, 12 layouts left a cluster member detached (14
+violations); the ground truth did so on only one of those designs.
+`reattach_clusters` in `rl/packer.py` (`FLOORSET_REATTACH`, on) tries, for
+each detached member, every free spot touching another piece of its cluster
+(slides along each side, other aspect ratios for soft blocks, shapes
+stretched to close the gap), scores them in one batch with the exact cost
+and keeps a move only if it's cheaper. It runs on every packer result and
+once at the end of `solve()`, <0.2 s. Where other blocks sit between the
+pieces, `FLOORSET_PACK_GAP` adds a search-only penalty on the distance
+between a cluster's pieces (per sqrt(area); the reported cost is unchanged).
+
+| 12 split-cluster designs        | Mean cost | Beats GT | Cluster violations |
+|---------------------------------|-----------|----------|--------------------|
+| cap-16 official                 | 1.120     | 6        | 14                 |
+| repair, penalty 0               | 1.120     | 7        | 7                  |
+| repair, penalty 1 (default)     | 1.086     | 9        | 2                  |
+| repair, penalty 3               | 1.090     | 8        | 1                  |
+
+Penalty 1 on designs 90-99 (no cluster problems): 1.0351 vs 1.0354.
+Official: cluster violations 14 -> 6 (25, 53, 54, 59, 70), new wins on
+5, 6, 41, 75, 84, one loss (43). 61 and 70 lose in every arm even with
+their clusters joined: an arrangement problem.
+
+## Arrangement losses: diagnosis, 10-16
+
+The ground truth's sequence pair (shapes perturbed, then fitted and packed)
+reaches 1.007 / 1.045 / 1.002 on designs 54 / 61 / 90, where we score
+1.315 / 1.303 / 1.167, so on those the arrangement is the gap. The learned
+placers' predicted centres are close to the ground truth (area-weighted
+distance 0.03-0.04 of the pin box, no block over 0.25), and the relation
+nets get 93-94% of block pairs right even on designs we lose. Packing
+those predictions displaces 13-24 blocks by more than 0.25.
+
+Moving k random blocks to random places in the ground truth's sequence
+pair, then packing (budget 20): k = 2 gives 1.02-1.30, k = 5 gives
+1.10-1.46 (designs 54, 61, 90, 98). 94% pair accuracy is about k = 5. The
+packer can't undo even two misplaced blocks, and neither can a greedy sweep
+that tries every block at every pair of sequence positions (98: 1.231 ->
+1.147, 1.715 -> 1.253): the landscape is rugged, and repairs need several
+blocks to move together.
+
+Tried, no gain (kept off): averaging the relation nets over mirrored
+copies of a design (views individually worse, average no better);
+spreading the predicted rectangles apart before reading the sequence pair
+(worse on 13 of 15 designs); `FLOORSET_PACK_ANCHOR`, a search-only pull
+toward placer_r's predicted centres fading over the first half of the
+search (10 loss designs, mean 1.166 off, 1.190 at 1, 1.201 at 3).
+
+## Repair network, violations and a second packer round, 10-16 to 10-17
+
+| Official, 100 designs                                     | Weighted | HPWL gap | Area gap | Beats GT |
+|-----------------------------------------------------------|----------|----------|----------|----------|
+| 10-16 default (cap 16, cluster fix)                       | 1.0432   | 0.017    | 0.035    | 72       |
+| + second packer round from the winner, wall penalty 100   | 1.0404   | 0.013    | 0.025    | 77       |
+
+Repair network. `scripts/train_repair.py` trains `PlacerNet(layout=True,
+rel_geom=True)`: the relation network plus each block's current centre and
+size, and the input layout's own pair relations, offsets and gaps fed into
+the relation head (zero-initialized, so step 0 is placer_r). Inputs are
+corrupted ground-truth layouts (k = 0..8 blocks moved, shapes perturbed) and
+the placers' own packed layouts. 280k designs: relation accuracy on own
+layouts 0.918 -> 0.921, on corrupted ones 0.954. `scripts/repair_eval.py`
+(8 hard designs, packer budget 20): 5 moved blocks 1.236 -> 1.088 after one
+round, but own layouts 1.153 -> 1.162 / 1.165 after one / two rounds. It
+stays off (candidate `repair<k>` in `rl/analytic.py`, net
+`FLOORSET_REPAIR_NET`). Training saves `<out>.state.pt` every validation;
+rerun the same command with `--resume` after a crash.
+
+Violations. With our violations removed and wirelength and area unchanged,
+the 10-16 run would beat the ground truth on 85 designs (1.0246). Most of
+the 38 edge violations are movable blocks just past the outline revealed by
+a right/top-pinned preplaced block. Shape fitting with a strong outline
+penalty and a greedy narrowing of critical-chain blocks changed nothing:
+these layouts are tight in x and y, so narrowing pushes past the top. The
+packer search penalty past the walls (`compact_pack(wall_pen=)`, env
+`FLOORSET_PACK_WALL`) does fix some: from the official layout, 17 goes
+1.099 -> 1.031 at penalty 100.
+
+Second round. `FLOORSET_REPACK_WINNER` (default on) repacks the finished
+winner once more (one packer job per top candidate, penalty
+`FLOORSET_WALL_PASS`, default 100) before squeeze / relax, kept only if
+cheaper; `FLOORSET_WALL_PASS` alone does it only when a preplaced wall is
+violated (`rl/packer.py wall_violations`). Offline from the 10-16 layouts:
+27 of 100 better, none worse. Official: new wins on 25, 49, 53, 92, 94,
+none lost; 405 s per design (was 210 s). The 10 largest designs beat the
+ground truth on 9 of 10 (`scripts/big_designs_pdf.py`); design 90 got
+worse (1.167 -> 1.270), run-to-run noise.
+
+## Violation restarts, 10-17 to 10-18
+
+| Official, 100 designs                                     | Weighted | HPWL gap | Area gap | Beats GT |
+|-----------------------------------------------------------|----------|----------|----------|----------|
+| 10-17 default (winner repack + wall pass)                 | 1.0404   | 0.013    | 0.025    | 77       |
+| + up to 3 solves while soft violations remain             | 1.0343   | 0.019    | 0.025    | 76       |
+
+Single designs swing by up to ~0.18 between runs (design 11: 1.007-1.184).
+On small designs much of that is one edge violation (3-8% each) that some
+runs avoid. Seven wall designs (11 12 31 43 69 14 18), one run each:
+default 1.094; outline penalty from the first packer round on the idle
+worker slots (`FLOORSET_WALL_START=100`) 1.110, on every job
+(`FLOORSET_WALL_START_ALL`, penalty 20) 1.105; two whole solves 1.091 at
+packer 100 and 1.092 at 200 -- all noise. Kept off.
+
+`FLOORSET_SOLVE_RUNS` (default 3) with `FLOORSET_RESTART_VIOL` (default on)
+in `my_optimizer.py`: after each whole solve, if the cheapest layout so far
+still has a soft violation (`rl/repack.py soft_violations`, exact, no
+ground truth), solve again with packer seeds offset by 1000 and the
+wall-start jobs on (penalty 100); keep the cheapest by
+`contest_relative_cost` against the first run's layout. Official:
+violating designs 26 -> 17, vrel 0.008 -> 0.004, 10 largest 1.040 -> 1.029
+(five at exactly 1.000), 641 s per design (max 3,007 s on 99). Wins flip
+both ways (+11, 12, 83; -49, 53, 84, 94, all within 0.02); best of the last
+five official runs per design would beat the ground truth on 82. On all 24
+remaining losses our violation count is at most the ground truth's (13
+have none): what is left is wirelength and area, i.e. the arrangement.

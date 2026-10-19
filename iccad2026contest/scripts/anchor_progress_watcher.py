@@ -19,11 +19,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
+torch.set_num_threads(1)  # runs alongside training; avoid oversubscription
 from PIL import Image
 
 from eval_checkpoint import solve_one, _regenerate_image
+from rl.checkpoint_meta import utilization_ladder
 from iccad2026_evaluate import ContestEvaluator
-from rl.networks import ActorCritic
+from rl.networks import ActorCritic, load_state
 
 ANCHOR_CASES = [0, 49, 98]
 CKPT_RE = re.compile(r"policy_iter(\d+)\.pt$")
@@ -44,18 +46,21 @@ def find_new_iters(history_dir: Path, interval: int, done: set) -> list:
 def process_iter(ev, history_dir: Path, out_dir: Path, it: int, time_budget: float, anneal_budget: float):
     ckpt_path = history_dir / f"policy_iter{it:06d}.pt"
     net = ActorCritic()
-    net.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+    load_state(net, ckpt_path)
     print(f"[iter {it}] loaded {ckpt_path}")
     stranded_summary = {}
     for tid in ANCHOR_CASES:
-        positions, m, stranded = solve_one(net, ev, tid, time_budget, anneal_budget, seed=tid)
+        positions, m, stranded = solve_one(net, ev, tid, time_budget, anneal_budget, seed=tid,
+                                           utilizations=utilization_ladder(str(ckpt_path)))
         stranded_summary[tid] = stranded['stranded']
         print(f"  case{tid}: hpwl_gap={m.hpwl_gap:.3f} area_gap={m.area_gap:.3f} "
               f"vrel={m.violations_relative:.3f} cost={m.cost:.3f} "
               f"feasible={m.is_feasible} stranded={stranded['stranded']}")
         tag = f"training_{it}"
         _regenerate_image(ev, tid, positions, m, tag)
+        # _regenerate_image always writes into the cwd; move it to out_dir.
         png = out_dir / f"floorplan_test{tid}_{tag}.png"
+        Path(f"floorplan_test{tid}_{tag}.png").replace(png)
         jpg = out_dir / f"case{tid}_iteration{it}.jpeg"
         Image.open(png).convert("RGB").save(jpg, "JPEG", quality=95)
         print(f"  saved {jpg}")

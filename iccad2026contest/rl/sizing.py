@@ -24,7 +24,7 @@ import torch
 from . import repack as R
 
 Position = Tuple[float, float, float, float]
-LOG_ASP = math.log(8.0) / 2     # w / sqrt(area) within [1/sqrt(8), sqrt(8)]: aspect 1/8 .. 8
+LOG_ASP = math.log(R.MAX_ASPECT) / 2     # w / sqrt(area) within [1/sqrt(8), sqrt(8)]: aspect 1/8 .. 8 (default)
 CLUSTER_W = 2.0                 # weight of the gap between a cluster member and its nearest clustermate
 BOX_W = 5.0                     # weight of running past the pin box (when `box` is given), 10-08
 

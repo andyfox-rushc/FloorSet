@@ -44,6 +44,10 @@ EPS = 1e-6
 # _fix_boundary snap mode: "orig", "noneg" or "reshape" (see there). 10-01,
 # 100 cached layouts, 1 s slice+repack: 1.530 / 1.529 / 1.527.
 SNAP_MODE = os.environ.get("FLOORSET_SNAP", "reshape")
+# Largest soft-block aspect ratio (long / short side) the polish, packer and shape
+# fitting may use (10-11, env FLOORSET_MAX_ASPECT; ground truth never exceeds 3).
+# 10-15: default 8 -> 16, official 1.0465 -> 1.0451 (official_eval_1012_cap16.json).
+MAX_ASPECT = float(os.environ.get("FLOORSET_MAX_ASPECT", "16"))
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +296,7 @@ def _chain(P, time_budget: float, seed: int):
         w, h = w.copy(), h.copy()
         for i in u:
             a, c_x, c_y = w[i] * h[i], x[i] + w[i] / 2, y[i] + h[i] / 2
-            nw = min(max(w[i] * f, math.sqrt(a / 8.0)), math.sqrt(a * 8.0))
+            nw = min(max(w[i] * f, math.sqrt(a / MAX_ASPECT)), math.sqrt(a * MAX_ASPECT))
             w[i], h[i] = nw, a / nw
             x[i], y[i] = c_x - nw / 2, c_y - h[i] / 2
         return w, h
@@ -398,7 +402,7 @@ def _fix_boundary(best, evaluate, cost_fn, P, rounds: int = 3):
             if SNAP_MODE == "reshape" and soft[a]:
                 ar = w[a] * h[a]
                 for f in (0.5, 0.7, 1.4, 2.0):
-                    nw = min(max(w[a] * f, math.sqrt(ar / 8.0)), math.sqrt(ar * 8.0))
+                    nw = min(max(w[a] * f, math.sqrt(ar / MAX_ASPECT)), math.sqrt(ar * MAX_ASPECT))
                     sw, sh = w.copy(), h.copy()
                     sw[a], sh[a] = nw, ar / nw
                     shapes.append((sw, sh))
@@ -472,6 +476,16 @@ def repack_polish(instance, positions: List[Position], time_budget: float = 8.0,
         print(f"  repack: relative cost {old_cost:.4f} -> {new_cost:.4f} "
               f"(feasible={feasible}, {len(results)} chains)")
     return cand if feasible and new_cost < old_cost else positions
+
+
+def soft_violations(instance, positions) -> int:
+    """Exact soft-constraint violation count (boundary + grouping + MIB) of a layout."""
+    from iccad2026_evaluate import evaluate_solution
+    from .reward import _target_positions_list
+    m = evaluate_solution({'positions': positions, 'runtime': 1.0}, {'hpwl_baseline': 1.0, 'area_baseline': 1.0},
+                          instance.constraints, instance.b2b_connectivity, instance.p2b_connectivity,
+                          instance.pins_pos, instance.area_targets, _target_positions_list(instance))
+    return int(m.total_soft_violations)
 
 
 def contest_relative_cost(instance, positions, reference):

@@ -184,7 +184,7 @@ def _build(P, cx, cy, W, H, split: str):
     return rx, ry, rw, rh
 
 
-MAX_ASPECT = 10.0
+MAX_ASPECT = float(os.environ.get("FLOORSET_MAX_ASPECT", "10"))   # 10 unless the cap is set (rl/repack.py)
 
 
 def _candidate(P, cx, cy, W, H, split, pre_mode="tree"):

@@ -16,24 +16,23 @@ from matplotlib.backends.backend_pdf import PdfPages
 W, H = 8.5, 11            # portrait letter
 LEFT, TOP, BOTTOM = 0.08, 0.95, 0.055
 REPO = "git@github.com:andyfox-rushc/FloorSet.git"
-BRANCH = "experiment1---(Claude-generated-version-of-Goldie-work)"   # main is Intel upstream only
 
 # Document content: (kind, ...) blocks laid out top to bottom with page breaks.
 #   ("h1", text) ("h2", text) ("p", text) ("code", [lines]) ("table", header, rows, widths) ("page",)
 DOC = [
     ("title", "Team ICB floorplanner: code, build and reproduction guide",
-     "ICCAD 2026 CAD Contest, Problem C (FloorSet-Lite)  |  10/11/2026"),
+     "ICCAD 2026 CAD Contest, Problem C (FloorSet-Lite)  |  10/18/2026"),
     ("h1", "Latest results"),
-    ("table", ["Measure (contest evaluator, 100 validation designs)", "Team ICB 10/11"], [
-        ["Official weighted score (exp(blocks/12) weights)", "1.0465"],
+    ("table", ["Measure (contest evaluator, 100 validation designs)", "Team ICB 10/18"], [
+        ["Official weighted score (exp(blocks/12) weights)", "1.0343"],
         ["Ground-truth layouts, scored by the same evaluator", "1.108"],
         ["Published leader (10/6 leaderboard, raw cost)", "1.084"],
-        ["Designs where we beat the ground truth's own score", "72 / 100"],
+        ["Designs where we beat the ground truth's own score", "76 / 100"],
         ["Feasible layouts", "100 / 100"],
-        ["Mean HPWL gap / area gap / relative violations", "0.022 / 0.036 / 0.011"],
-        ["Mean runtime per design (8-core laptop, see 6)", "209 s"],
+        ["Mean HPWL gap / area gap / relative violations", "0.019 / 0.025 / 0.004"],
+        ["Mean runtime per design (8-core laptop, see 6)", "641 s"],
     ], [0.72, 0.28]),
-    ("p", "Reference result file: iccad2026contest/official_eval_1011_pack200.json (every design's layout, "
+    ("p", "Reference result file: iccad2026contest/official_eval_1018_restart.json (every design's layout, "
           "cost and runtime). 1.0 means the ground truth's wirelength and area; the ground truth itself "
           "scores 1.108 because it breaks some of its own edge and cluster constraints."),
     ("p", "This document is for someone who wants to reproduce and verify these results: what to "
@@ -41,14 +40,12 @@ DOC = [
           "every trained model was produced."),
 
     ("h1", "1. Get the code"),
-    ("code", [f"git clone -b '{BRANCH}' \\",
-              f"    {REPO}",
+    ("code", [f"git clone {REPO}",
               "cd FloorSet",
               "# all solver commands below run from FloorSet/iccad2026contest"]),
     ("p", "The repository is a fork of Intel's FloorSet repository. The top level holds Intel's "
           "dataset loaders and the 100 validation designs (LiteTensorDataTest/); our solver lives "
-          "in iccad2026contest/ next to the contest evaluator. The solver is on the branch above "
-          "only: the default branch (main) is Intel's code without it."),
+          "in iccad2026contest/ next to the contest evaluator."),
 
     ("h1", "2. Install"),
     ("p", "No compilation step: everything is Python. Tested with Python 3.14.4 and the versions "
@@ -70,24 +67,27 @@ DOC = [
     ("h2", "Full run (the official number)"),
     ("code", ["cd iccad2026contest",
               "../venv/bin/python iccad2026_evaluate.py --evaluate my_optimizer.py \\",
-              "    --output my_run.json            # ~6 h on 8 cores",
-              "../venv/bin/python scripts/compare_with_gt.py my_run.json official_eval_1011_pack200.json"]),
+              "    --output my_run.json            # ~18 h on 8 cores",
+              "../venv/bin/python scripts/compare_with_gt.py my_run.json official_eval_1018_restart.json"]),
     ("p", "The evaluator prints the total score; compare_with_gt.py scores the ground-truth layouts "
           "with the same evaluator and prints, for each result file, the weighted score, the mean "
           "gaps, how many designs beat the ground truth and the largest losses. All defaults are "
-          "the configuration that produced 1.0465; no environment variables are needed."),
-    ("h2", "Quick check (about 10-15 minutes)"),
+          "the configuration that produced 1.0343; no environment variables are needed. The count of "
+          "designs that beat the ground truth moves more than the score between runs (76 in this run, "
+          "77 in the 10/17 run at 1.0404, 72 in the 10/16 run at 1.0432)."),
+    ("h2", "Quick check (about 15 + 35 minutes)"),
     ("code", ["../venv/bin/python scripts/solver_ab.py --ids 0 98 --out quick.json",
               "../venv/bin/python scripts/anchor_results.py --test-ids 0 49 98 --out-dir anchors"]),
     ("p", "solver_ab.py solves chosen designs one at a time exactly as the evaluator does. Ours: "
-          "design 0 1.046 and design 98 1.044 in the official run; over three further runs 1.014-1.037 "
-          "and 1.007-1.039 (ground truth 1.091 and 1.080). anchor_results.py also draws each layout "
-          "next to the ground truth (PNG files)."),
+          "design 0 1.000 and design 98 1.000 in the official run; 1.000-1.012 and 1.000 over three "
+          "further runs (ground truth 1.091 and 1.080). Design 98 takes about 16 minutes, design 49 "
+          "about 17 (it keeps a violation, so it always gets 3 solves). "
+          "anchor_results.py also draws each layout next to the ground truth (PNG files)."),
     ("h2", "What to expect"),
     ("p", "Results vary from run to run: the packer searches for a fixed wall-clock time, so "
           "machine speed and load change how far it gets. Our repeated runs of one configuration "
           "differ by about +-0.01 on the weighted score, and single designs much more (design 49: "
-          "1.159-1.274 over three runs). Run on an otherwise idle machine; a slower or busy machine "
+          "1.127-1.274 over our runs). Run on an otherwise idle machine; a slower or busy machine "
           "scores worse. Six worker processes are used (FLOORSET_PROCS, default min(6, cpus))."),
 
     ("page",),
@@ -137,8 +137,9 @@ DOC = [
         ["iccad2026contest/scripts/compare_with_gt.py", "Verify a result file against the ground truth"],
         ["iccad2026contest/scripts/solver_ab.py", "Solve chosen designs one at a time"],
         ["iccad2026contest/scripts/anchor_results.py", "Solve + draw layouts vs ground truth"],
+        ["iccad2026contest/scripts/big_designs_pdf.py", "Ground truth vs ours for the largest designs (PDF)"],
         ["iccad2026contest/scripts/generate_code_doc_pdf.py", "Builds this document"],
-        ["iccad2026contest/official_eval_1011_pack200.json", "Reference result (1.0465)"],
+        ["iccad2026contest/official_eval_1018_restart.json", "Reference result (1.0343)"],
         ["iccad2026contest/algorithm.md", "Design notes and every experiment, dated"],
         ["iccad2026contest/requirements.txt", "Python packages"],
     ], [0.55, 0.45]),
@@ -159,9 +160,16 @@ DOC = [
         ["4. Shape fitting", "Gradient descent on soft-block aspect ratios for a fixed arrangement"],
         ["5. Best-of", "All candidates scored; the best plus the four learned ones go on"],
         ["6. Packer", "Sequence-pair annealing on the exact contest cost, 200 s at 77 blocks "
-                      "(scaled by (blocks/77)^2), one process per layout, shape refit halfway"],
-        ["7. Finish", "Squeeze, wirelength relaxation, then the cheapest layout inside the box "
-                      "where the pins sit (preferred within 5% of the best cost)"],
+                      "(scaled by (blocks/77)^2), one process per layout, shape refit halfway; "
+                      "split clusters penalized in the search and repaired exactly afterwards"],
+        ["7. Second round", "The winner is packed once more from where it ended, with a search penalty "
+                            "for running past the outline revealed by preplaced edge blocks; kept only if "
+                            "cheaper (new 10/17)"],
+        ["8. Finish", "Squeeze, wirelength relaxation, then the cheapest layout inside the box "
+                      "where the pins sit (preferred within 5% of the best cost); soft blocks up to 16:1 throughout"],
+        ["9. Restarts", "While the cheapest layout still breaks a soft constraint, stages 1-8 run "
+                        "again with new seeds (at most 3 runs), the reruns also aiming for the outline; "
+                        "cheapest kept (new 10/18)"],
     ], [0.22, 0.78]),
     ("h2", "The policy and models used"),
     ("table", ["Candidate", "Checkpoint", "Arrangement from"], [
@@ -172,10 +180,17 @@ DOC = [
         ["learned3", "placer_r.pt", "predicted centres"],
         ["learned4", "placer_relB.pt", "predicted pairwise relations"],
     ], [0.3, 0.3, 0.4]),
-    ("h2", "Settings (defaults = the 1.0465 run)"),
+    ("h2", "Settings (defaults = the 1.0343 run)"),
     ("table", ["Environment variable", "Default", "Meaning"], [
         ["FLOORSET_PACK", "200", "Packer seconds per layout at 77 blocks"],
         ["FLOORSET_PROCS", "min(6, cpus)", "Worker processes"],
+        ["FLOORSET_MAX_ASPECT", "16", "Longest soft-block side / shortest (was 8 until 10/15)"],
+        ["FLOORSET_REATTACH", "1", "Exact repair of split clusters after packing (new 10/16)"],
+        ["FLOORSET_PACK_GAP", "1", "Search penalty on cluster-piece distance (new 10/16)"],
+        ["FLOORSET_REPACK_WINNER", "1", "Second packer round from the winner, kept if cheaper (new 10/17)"],
+        ["FLOORSET_WALL_PASS", "100", "Search penalty past preplaced walls in that round (new 10/17)"],
+        ["FLOORSET_SOLVE_RUNS", "3", "Most whole solves per design (new 10/18)"],
+        ["FLOORSET_RESTART_VIOL", "1", "Solve again only while soft violations remain (new 10/18)"],
         ["FLOORSET_CANDIDATES", "base,scratch0.75..1.0,learned..learned4", "Candidate layouts"],
         ["FLOORSET_CHECKPOINT", "checkpoints/policy.pt", "RL policy"],
         ["FLOORSET_PLACER, ..._PLACER4", "see table above", "Learned placer checkpoints"],
@@ -184,7 +199,7 @@ DOC = [
 
     ("h1", "6. Machine used for the results"),
     ("p", "Intel Core Ultra 7 258V (8 cores), 16 GB RAM, Windows 11 + WSL2 (Linux 6.18), CPU only. "
-          "One official run of the 100 designs took about 5.6 hours (209 s per design on average, "
+          "One official run of the 100 designs took about 18 hours (641 s per design on average, "
           "most of it the packer's fixed time budget)."),
 
     ("page",),

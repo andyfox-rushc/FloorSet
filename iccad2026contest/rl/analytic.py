@@ -219,6 +219,8 @@ def build_candidate(instance, rl_positions, name: str, seed: int = 0) -> List[Po
         p = analytic_solve(instance, util=float(kind[7:]), iters=it, seed=sd)
     elif kind.startswith("learned"):   # 10-08: learned placer(s) (rl/learned_placer.py) + shape fitting
         return learned_candidate(instance, rl_positions, index=int(kind[7:] or 1))
+    elif kind.startswith("repair"):    # 10-17: placer_r's arrangement, then k repair-net rounds
+        return learned_candidate(instance, rl_positions, index=2, repair_rounds=int(kind[6:] or 2))
     else:
         raise ValueError(name)
     return repack_polish(instance, slicing_polish(instance, p, time_budget=budget / 2),
@@ -247,7 +249,10 @@ SAMPLE_NOISE = float(os.environ.get("FLOORSET_PLACER_NOISE", "0.02"))          #
 SAMPLE_ASPECT_NOISE = float(os.environ.get("FLOORSET_PLACER_ASPECT_NOISE", "0.2"))   # log aspect
 
 
-def learned_candidate(instance, fallback, index: int = 1):
+REPAIR_NET = os.environ.get("FLOORSET_REPAIR_NET", "repair_d.pt")
+
+
+def learned_candidate(instance, fallback, index: int = 1, repair_rounds: int = 0):
     """Predicted arrangement -> collisions resolved (shape fitting, else moving
     blocks) -> shapes fitted. Falls back to `fallback` without a checkpoint.
     Two checkpoints (10-08): each alone ~1.21 with packer 6 on 100 designs, the
@@ -291,6 +296,21 @@ def learned_candidate(instance, fallback, index: int = 1):
     if over > 1e-6:        # deterministic prediction: shape fitting first, then the repair
         fitted = fit_shapes(instance, pos, iters=600, lr=0.02, seqs=(gp, gm))
         pos = fitted if fitted is not pos and feasible(fitted) else repair(det)
+    if repair_rounds and pos is not None:
+        # 10-17 repair net (scripts/train_repair.py): re-predict the arrangement from
+        # the current layout; 8 hard designs, own layout x2 rounds: 1.1445 -> 1.1004
+        rpath = os.path.join(ck, REPAIR_NET)
+        if rpath not in _PLACER:
+            _PLACER[rpath] = L.load(rpath)
+        for _ in range(repair_rounds):
+            d2 = L.to_layout(instance, _PLACER[rpath], use_rel=True, layout=pos)
+            q, _, o2 = d2
+            if o2 > 1e-6:
+                f2 = fit_shapes(instance, q, iters=600, lr=0.02, seqs=d2[1])
+                q = f2 if f2 is not q and feasible(f2) else repair(d2)
+            if q is None or not feasible(q):
+                break
+            pos = q
     starts = [pos] if pos is not None and feasible(pos) else []
     # Sample-and-rank (10-09): extra sampled arrangements, ranked by the honest cheap
     # reward r2 (fit 200 steps + 1 s packer; within-design rank correlation 0.54 with the

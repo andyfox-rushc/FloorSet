@@ -50,12 +50,34 @@ ORIGIN = os.environ.get("FLOORSET_ORIGIN", "1") != "0"
 # in-box layouts are preferred wherever a best is picked.
 PINBOX_PEN = float(os.environ.get("FLOORSET_PINBOX", "3"))
 RELAX_CLUSTERS = os.environ.get("FLOORSET_RELAX_CLUSTERS", "1") != "0"   # see relax_hpwl
+# Cluster repair of every packer result (10-15, reattach_clusters): cap-16 official layouts
+# 14 -> 8 split clusters, beat GT 68 -> 69, weighted 1.04515 -> 1.04495 (never worse).
+REATTACH = os.environ.get("FLOORSET_REATTACH", "1") != "0"
+# Search-only penalty per sqrt(area) of distance between the pieces of a split cluster
+# (10-15 A/B: 1 beat 0 and 3; split clusters 14 -> 2). Steers toward contact.
+GAP_PEN = float(os.environ.get("FLOORSET_PACK_GAP", "1"))
+# Search-only pull toward the relation net's predicted centres (10-16, 0 = off),
+# fading to 0 over the first half of the search: its centres are ~0.04 of the box off.
+ANCHOR = float(os.environ.get("FLOORSET_PACK_ANCHOR", "0"))
+ANCHOR_NET = os.environ.get("FLOORSET_ANCHOR_NET", "placer_r.pt")
+_ANCHOR_NETS = {}
 # In-box layouts are preferred only if at most BOX_TOL dearer on the relative-cost
 # scale (~2x the contest cost, so 0.025 ~ 5% of contest cost); user choice 10-07.
 BOX_TOL = float(os.environ.get("FLOORSET_BOX_TOL", "0.025"))
 # 10-10: right / top pinned preplaced blocks sit on the true outline, which is
 # often well inside the pin box (99: x 129 vs 147); use it as the box there.
 WALLBOX = os.environ.get("FLOORSET_WALLBOX", "0") != "0"
+# 10-16: repack a winner that runs past a preplaced wall with this WALL_PEN (0 = off)
+WALL_PASS = float(os.environ.get("FLOORSET_WALL_PASS", "100"))
+# 10-17: second packer round from the winner on every design (offline: 27/100 better, none worse);
+# official with WALL_PASS 100: 1.0432 / 72 beat GT -> 1.0404 / 77, 210 -> 405 s per design
+REPACK_WINNER = os.environ.get("FLOORSET_REPACK_WINNER", "1") != "0"
+# 10-17: aim for the preplaced walls from the first packer round on designs that have them:
+# WALL_START = penalty (0 = off) on WALL_START_JOBS extra jobs (-1 = the idle worker slots),
+# or on every job when WALL_START_ALL
+WALL_START = float(os.environ.get("FLOORSET_WALL_START", "0"))
+WALL_START_JOBS = int(os.environ.get("FLOORSET_WALL_START_JOBS", "-1"))
+WALL_START_ALL = os.environ.get("FLOORSET_WALL_START_ALL", "0") != "0"
 
 
 def prefer_in_box(costs, inside, tol=None):
@@ -178,6 +200,8 @@ class _Batch:
         self.ar = None
         self.box = None            # (max x, max y) pin box, set by compact_pack
         self.box_pen = PINBOX_PEN
+        self.wall_pen = WALL_PEN
+        self.anchor, self.anchor_w = None, 0.0     # (tx, ty, weight per block), current weight
         # Wirelength terms (10-06): parallel block-block nets merged; pin nets
         # as per-block piecewise-linear sums sum_k w_k |c - p_k|, evaluated
         # from sorted pins + prefix sums (one search per block, not per pin).
@@ -279,6 +303,7 @@ class _Batch:
         off = ((self.left & (np.abs(x - X0) > EPS)) | (self.right & (np.abs(x1 - X1) > EPS))
                | (self.top & (np.abs(y1 - Y1) > EPS)) | (self.bottom & (np.abs(y - Y0) > EPS)))
         v = off.sum(axis=1).astype(float) + self.mib_v
+        gap = np.zeros(len(x))
         for g in self.groups:
             gx, gy, gx1, gy1 = x[:, g], y[:, g], x1[:, g], y1[:, g]
             ovx = np.minimum(gx1[:, :, None], gx1[:, None, :]) - np.maximum(gx[:, :, None], gx[:, None, :])
@@ -291,6 +316,13 @@ class _Batch:
                     break
                 lab = new
             v += (lab == np.arange(len(g))).sum(axis=1) - 1
+            if GAP_PEN > 0:     # each piece's distance to the rest of its cluster (counted from both sides)
+                dist = np.maximum(-ovx, 0) + np.maximum(-ovy, 0)
+                other = lab[:, :, None] != lab[:, None, :]
+                di = np.where(other, dist, np.inf).min(axis=2)
+                for l in range(len(g)):
+                    cm = np.where(lab == l, di, np.inf).min(axis=1)
+                    gap += np.where(np.isfinite(cm), cm, 0.0)
         q = 1 + R.ALPHA * (hp / self.ref_hpwl + area / self.ref_area)
         c = q * np.exp(R.BETA * v / self.n_soft)
         scale = math.sqrt(self.ref_area)
@@ -300,7 +332,13 @@ class _Batch:
         if self.box is not None:
             self.out_box = np.maximum(X1[:, 0] - self.box[0], 0) + np.maximum(Y1[:, 0] - self.box[1], 0)
             c = c * (1.0 + self.box_pen * self.out_box / scale)
-        if WALL_PEN > 0 and self.walls_any:
+        if GAP_PEN > 0:
+            c = c * (1.0 + GAP_PEN * gap / (2 * scale))
+        if self.anchor is not None and self.anchor_w > 0:
+            tx, ty, aw = self.anchor
+            d = (aw * (np.abs(x + w / 2 - tx) + np.abs(y + h / 2 - ty))).sum(axis=1)
+            c = c * (1.0 + self.anchor_w * d / scale)
+        if self.wall_pen > 0 and self.walls_any:
             # search-only pull back inside the walls of pinned preplaced blocks
             x_lo, y_lo, x_hi, y_hi = self.walls
             out = np.zeros(len(c))
@@ -312,7 +350,7 @@ class _Batch:
                 out += np.maximum(X1[:, 0] - x_hi, 0)
             if y_hi is not None:
                 out += np.maximum(Y1[:, 0] - y_hi, 0)
-            c = c * (1.0 + WALL_PEN * out / scale)
+            c = c * (1.0 + self.wall_pen * out / scale)
         return c
 
 
@@ -390,19 +428,37 @@ def _origin_repair(Bt, gp, gm, w, h, max_moves=None):
     return (gp, gm) if over[0] <= EPS else None
 
 
+def anchor_targets(instance, P):
+    """(tx, ty, area share) from the anchor net's predicted centres; preplaced
+    blocks get weight 0. None without the checkpoint."""
+    from . import learned_placer as L
+    path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", ANCHOR_NET)
+    if path not in _ANCHOR_NETS:
+        _ANCHOR_NETS[path] = L.load(path)
+    net = _ANCHOR_NETS[path]
+    if net is None:
+        return None
+    cx, cy, _ = L.predict(net, instance)
+    a = np.where(P["preplaced"], 0.0, np.maximum(P["area"], 0.0))
+    return np.asarray(cx, float), np.asarray(cy, float), a / max(a.sum(), 1e-12)
+
+
 def compact_pack(instance, positions: List[Position], time_budget: float = 1.5,
                  seed: Optional[int] = None, verbose: bool = False,
-                 box_pen: Optional[float] = None, _inner: bool = False) -> List[Position]:
+                 box_pen: Optional[float] = None, _inner: bool = False,
+                 _anchor: bool = False, wall_pen: Optional[float] = None) -> List[Position]:
     if REFIT and not _inner and time_budget >= 2.0:
         # 10-08: half the search, refit all soft shapes jointly for the arrangement
         # found (rl/sizing.py), then the other half from the refitted layout
         from .sizing import fit_shapes
         t0 = time.time()
-        first = compact_pack(instance, positions, time_budget / 2, seed, verbose, box_pen, _inner=True)
+        first = compact_pack(instance, positions, time_budget / 2, seed, verbose, box_pen, _inner=True,
+                             _anchor=ANCHOR > 0, wall_pen=wall_pen)
         box = pin_box(instance) if PINBOX_PEN > 0 else None
         fitted = fit_shapes(instance, first, iters=REFIT_ITERS, lr=0.02, box=box)
         rest = max(time_budget - (time.time() - t0), 0.5)
-        return compact_pack(instance, fitted, rest, None if seed is None else seed + 1, verbose, box_pen, _inner=True)
+        return compact_pack(instance, fitted, rest, None if seed is None else seed + 1, verbose, box_pen, _inner=True,
+                            wall_pen=wall_pen)
     rng = random.Random(seed)
     P = R._problem(instance, positions)
     n = P["n"]
@@ -421,8 +477,12 @@ def compact_pack(instance, positions: List[Position], time_budget: float = 1.5,
     Bt.box = box
     if box_pen is not None:
         Bt.box_pen = box_pen
+    if wall_pen is not None:
+        Bt.wall_pen = wall_pen
     Bt.mib_v = sum(len({(round(w0[i], 4), round(h0[i], 4)) for i in g}) - 1
                    for g in tmp.mibs)
+    if _anchor:
+        Bt.anchor = anchor_targets(instance, P)
 
     soft = ~P["fixed"] & ~P["preplaced"] & (P["area"] > 0)
     units, seen = [], set()
@@ -505,7 +565,7 @@ def compact_pack(instance, positions: List[Position], time_budget: float = 1.5,
                 f = rng.uniform(0.75, 0.97) if side == 0 else 1.0 / rng.uniform(0.75, 0.97)
                 for i in u:
                     a = w[i] * h[i]
-                    nw = min(max(w[i] * f, math.sqrt(a / 8.0)), math.sqrt(a * 8.0))
+                    nw = min(max(w[i] * f, math.sqrt(a / R.MAX_ASPECT)), math.sqrt(a * R.MAX_ASPECT))
                     w[i], h[i] = nw, a / nw
             return gp, gm, w, h
         if r < 0.25 and units:                                  # reshape a soft unit
@@ -513,7 +573,7 @@ def compact_pack(instance, positions: List[Position], time_budget: float = 1.5,
             f = math.exp(rng.gauss(0.0, 0.3))
             for i in units[rng.randrange(len(units))]:
                 a = w[i] * h[i]
-                nw = min(max(w[i] * f, math.sqrt(a / 8.0)), math.sqrt(a * 8.0))
+                nw = min(max(w[i] * f, math.sqrt(a / R.MAX_ASPECT)), math.sqrt(a * R.MAX_ASPECT))
                 w[i], h[i] = nw, a / nw
         elif r < 0.6:                                           # swap a pair in G+, G- or both
             a, b = rng.sample(range(n), 2)
@@ -579,6 +639,8 @@ def compact_pack(instance, positions: List[Position], time_budget: float = 1.5,
             t0 = T_SCALE * max(abs(float(cs[k]) - cur[0]), 1e-4)
         frac = (time.time() - start) / time_budget
         temp = t0 * (0.001 ** frac)
+        if Bt.anchor is not None:
+            Bt.anchor_w = ANCHOR * max(0.0, 1.0 - frac)
         if cs[k] <= cur[0] or rng.random() < math.exp(-(cs[k] - cur[0]) / max(temp, 1e-12)):
             cur = (float(cs[k]),) + props[k]
             cur_xy[0], cur_xy[1] = xs[k] + cur[3] / 2, ys[k] + cur[4] / 2
@@ -690,7 +752,7 @@ def squeeze(instance, positions: List[Position], rounds: int = 200,
         for u in units:
             i = u[0]
             ux, uy = float(sx[u].min()), float(sy[u].min())
-            lo, hi = math.sqrt(area[i] / 8.0), math.sqrt(area[i] * 8.0)
+            lo, hi = math.sqrt(area[i] / R.MAX_ASPECT), math.sqrt(area[i] * R.MAX_ASPECT)
             for f in fracs + (0.15,):
                 if uy < 1e-6 < ux:          # height-critical: widen into the x room
                     d, nw = 0, min(w[i] + f * ux, hi)
@@ -818,11 +880,122 @@ def relax_hpwl(instance, positions: List[Position], sweeps: int = 30) -> List[Po
     return cand if ok and new < old else positions
 
 
+def _attach_spots(P, x, y, w, h, a, anchors, soft, ratios, t):
+    """Candidate (x, y, w, h) arrays for block a abutting any of `anchors`:
+    slides along each side (soft: several aspect ratios), and for soft a,
+    stretches that keep a's far edge and end exactly on the anchor's edge."""
+    ar = w[a] * h[a]
+    sw = np.concatenate([[w[a]], np.sqrt(ar * ratios)]) if soft[a] else np.array([w[a]])
+    sh = ar / sw
+    out = []
+
+    def add(px, py, wa, ha):
+        px, py = np.atleast_1d(np.asarray(px, float)), np.atleast_1d(np.asarray(py, float))
+        px, py = np.broadcast_arrays(px, py)
+        out.append((px, py, np.full(px.shape, wa), np.full(px.shape, ha)))
+    for b in anchors:
+        for wa, ha in zip(sw, sh):
+            d = 1e-3 * min(wa, ha, w[b], h[b])      # keep a real overlap along the shared edge
+            ys = y[b] - ha + d + t * (h[b] + ha - 2 * d)
+            xs = x[b] - wa + d + t * (w[b] + wa - 2 * d)
+            add(x[b] + w[b], ys, wa, ha), add(x[b] - wa, ys, wa, ha)
+            add(xs, y[b] + h[b], wa, ha), add(xs, y[b] - ha, wa, ha)
+        if not soft[a]:
+            continue
+        for lo, hi, horiz in ((x[a], x[b], True), (x[b] + w[b], x[a] + w[a], True),
+                              (y[a], y[b], False), (y[b] + h[b], y[a] + h[a], False)):
+            ln = hi - lo
+            if ln <= EPS or not (1.0 / R.MAX_ASPECT <= (ln * ln / ar if horiz else ar / (ln * ln)) <= R.MAX_ASPECT):
+                continue
+            if horiz:
+                ha = ar / ln
+                add(lo, [y[a], y[a] + h[a] - ha, y[b], y[b] + h[b] - ha], ln, ha)
+            else:
+                wa = ar / ln
+                add([x[a], x[a] + w[a] - wa, x[b], x[b] + w[b] - wa], lo, wa, ln)
+    return [np.concatenate([o[k] for o in out]) for k in range(4)]
+
+
+def reattach_clusters(instance, positions: List[Position], rounds: int = 4,
+                      offsets: int = 9, n_shapes: int = 13) -> List[Position]:
+    """Cluster repair after packing (10-15): a member of one touching piece
+    of a split cluster tries every free spot abutting another piece
+    (_attach_spots); all spots are scored at once with the exact cost and
+    the best kept while cheaper. Nothing else moves, so contact is exact."""
+    from .legalize import _components
+    P = R._problem(instance, positions)
+    n = P["n"]
+    pos = P["pos"]
+    x, y, w, h = pos[:, 0].copy(), pos[:, 1].copy(), pos[:, 2].copy(), pos[:, 3].copy()
+    cl = P["cluster"]
+    groups = [g for g in (np.where(cl == k)[0] for k in range(1, int(cl.max(initial=0)) + 1)) if len(g) > 1]
+    if n < 2 or not groups:
+        return positions
+    tmp = R._Cost(P, 1.0, 1.0)
+    ref_area = float(((x + w).max() - x.min()) * ((y + h).max() - y.min()))
+    Bt = _Batch(P, tmp.hpwl(x, y, w, h), ref_area, (0.0, 0.0))
+    Bt.box = pin_box(instance) if PINBOX_PEN > 0 else None
+    Bt.mib_v = sum(len({(round(w[i], 4), round(h[i], 4)) for i in g}) - 1 for g in tmp.mibs)
+    soft = ~P["fixed"] & ~P["preplaced"] & (P["area"] > 0) & (P["mib"] == 0)
+    ratios = np.geomspace(1.0 / R.MAX_ASPECT, R.MAX_ASPECT, n_shapes)
+    t = np.linspace(0.0, 1.0, offsets)
+    cur = float(Bt.cost(x[None], y[None], w[None], h[None], np.zeros(1))[0])
+    for _ in range(rounds):
+        improved = False
+        for g in groups:
+            comps = _components(P, x, y, w, h, g)
+            if len(comps) < 2:
+                continue
+            for ci, comp in enumerate(comps):
+                anchors = np.concatenate([c for cj, c in enumerate(comps) if cj != ci])
+                for a in (int(v) for v in comp if not P["preplaced"][v]):
+                    cx, cy, cw, ch = _attach_spots(P, x, y, w, h, a, anchors, soft, ratios, t)
+                    others = np.arange(n) != a
+                    ovx = np.minimum(cx[:, None] + cw[:, None], (x + w)[None, others]) - np.maximum(cx[:, None], x[None, others])
+                    ovy = np.minimum(cy[:, None] + ch[:, None], (y + h)[None, others]) - np.maximum(cy[:, None], y[None, others])
+                    k = np.where(~((ovx > EPS) & (ovy > EPS)).any(axis=1) & (cx >= -EPS) & (cy >= -EPS))[0]
+                    if not len(k):
+                        continue
+                    X, Y = np.repeat(x[None], len(k), 0), np.repeat(y[None], len(k), 0)
+                    W, H = np.repeat(w[None], len(k), 0), np.repeat(h[None], len(k), 0)
+                    X[:, a], Y[:, a], W[:, a], H[:, a] = cx[k], cy[k], cw[k], ch[k]
+                    c = Bt.cost(X, Y, W, H, np.zeros(len(k)))
+                    j = int(np.argmin(c))
+                    if c[j] < cur - 1e-12:
+                        cur, improved = float(c[j]), True
+                        x[a], y[a], w[a], h[a] = X[j, a], Y[j, a], W[j, a], H[j, a]
+        if not improved:
+            break
+    cand = [(float(x[i]), float(y[i]), float(w[i]), float(h[i])) for i in range(n)]
+    old, _ = R.contest_relative_cost(instance, positions, positions)
+    new, ok = R.contest_relative_cost(instance, cand, positions)
+    return cand if ok and new < old else positions
+
+
+def has_walls(instance, positions: List[Position]) -> bool:
+    """Does a right/top-pinned preplaced block reveal part of the outline?"""
+    from .legalize import walls
+    _, _, xh, yh = walls(R._problem(instance, positions))
+    return xh is not None or yh is not None
+
+
+def wall_violations(instance, positions: List[Position]) -> int:
+    """Pinned preplaced blocks whose required edge is off the bounding box
+    (the layout runs past the wall they reveal)."""
+    P = R._problem(instance, positions)
+    p, bnd = P["pos"], P["bnd"]
+    x, y, x1, y1 = p[:, 0], p[:, 1], p[:, 0] + p[:, 2], p[:, 1] + p[:, 3]
+    off = (((bnd & 1) != 0) & (np.abs(x - x.min()) > EPS)) | (((bnd & 2) != 0) & (np.abs(x1 - x1.max()) > EPS)) \
+        | (((bnd & 4) != 0) & (np.abs(y1 - y1.max()) > EPS)) | (((bnd & 8) != 0) & (np.abs(y - y.min()) > EPS))
+    return int((off & P["preplaced"]).sum())
+
+
 def _pack_job(args):
-    """Process-pool entry: (instance, positions, time_budget, seed[, box_pen]) -> positions."""
+    """Process-pool entry: (instance, positions, time_budget, seed[, box_pen[, wall_pen]]) -> positions."""
     instance, positions, budget, seed = args[:4]
-    return compact_pack(instance, positions, time_budget=budget, seed=seed,
-                        box_pen=args[4] if len(args) > 4 else None)
+    out = compact_pack(instance, positions, time_budget=budget, seed=seed,
+                       box_pen=args[4] if len(args) > 4 else None, wall_pen=args[5] if len(args) > 5 else None)
+    return reattach_clusters(instance, out) if REATTACH else out
 
 
 def init_worker():
