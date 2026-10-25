@@ -1,0 +1,286 @@
+"""
+Policy / value / reward-approximation heads sitting on top of the shared
+NetlistEncoder trunk. Kept decoupled from GridPlacementEnv -- everything
+here takes plain tensors, so it's independently testable (shapes, masking,
+gradient flow) without a live environment.
+
+PolicyNet has two heads, mirroring the two-phase action in env.py:
+    - aspect head:   MLP over [block_embedding, global_embedding, progress]
+                     -> logits over the fixed aspect-ratio bucket list.
+    - position head: a small CNN over the occupancy grid (+ cluster grid),
+                     with the current block's embedding broadcast in as
+                     extra channels, producing a full [grid_dim, grid_dim]
+                     logit map. The caller crops this to the valid
+                     [out_h, out_w] region and masks it (see rl/ppo.py).
+"""
+
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .encoder import NetlistEncoder
+
+NEG_INF = -1e9
+# Step features (see GridPlacementEnv.step_features): what is still to come.
+# Callers pass `progress` either as the plain progress value (features then
+# count as zero) or as [progress, *features]; the features sit at the END of
+# each head's first layer so older checkpoints migrate by appending zero
+# columns (scripts/migrate_checkpoint_step_features.py).
+NUM_STEP_FEATS = 6
+# Policy-architecture experiment switches (10-04, 3-arm A/B): FLOORSET_POS_NET
+# = "cnn" (default, 5x5-cell view) | "unet" (whole-canvas view);
+# FLOORSET_TARGET_MAP=1 adds the analytic placer's target map as a second
+# "wiremask" channel (rl/env.py target_map). Checkpoints only load into the
+# same architecture, so set the same switches when using them.
+POS_NET = os.environ.get("FLOORSET_POS_NET", "cnn")
+TARGET_MAP = os.environ.get("FLOORSET_TARGET_MAP", "0") != "0"
+
+
+def _spatial(occupancy, cluster_grid, wiremask, batched):
+    """Stack the spatial channels; wiremask may carry extra channels."""
+    if batched:
+        wm = wiremask if wiremask.dim() == 4 else wiremask.unsqueeze(1)
+        return torch.cat([occupancy.unsqueeze(1), cluster_grid.unsqueeze(1), wm], dim=1)
+    wm = wiremask if wiremask.dim() == 3 else wiremask.unsqueeze(0)
+    return torch.cat([occupancy.unsqueeze(0), cluster_grid.unsqueeze(0), wm], dim=0)
+
+
+def _ctx1(progress):
+    """Unbatched: progress is a scalar or [1 + NUM_STEP_FEATS] -> [1 + NUM_STEP_FEATS]."""
+    v = progress.reshape(-1)
+    if v.numel() == 1:
+        v = torch.cat([v, torch.zeros(NUM_STEP_FEATS, dtype=v.dtype)])
+    return v
+
+
+def _ctxN(progresses):
+    """Batched: progresses is [N] or [N, 1 + NUM_STEP_FEATS] -> [N, 1 + NUM_STEP_FEATS]."""
+    if progresses.dim() == 1:
+        progresses = torch.cat([progresses.unsqueeze(-1),
+                                torch.zeros(progresses.shape[0], NUM_STEP_FEATS, dtype=progresses.dtype)], dim=-1)
+    return progresses
+
+
+def masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """logits, mask: same shape; mask True = valid. Returns log-probs that
+    are -inf (zero probability) wherever mask is False."""
+    assert mask.any(), "masked_log_softmax called with an all-False mask"
+    filled = logits.masked_fill(~mask, NEG_INF)
+    return F.log_softmax(filled.reshape(-1), dim=0).reshape(logits.shape)
+
+
+class AspectHead(nn.Module):
+    def __init__(self, hidden_dim: int, num_aspects: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, num_aspects),
+        )
+
+    def forward(self, block_embedding, global_embedding, progress):
+        x = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
+        return self.mlp(x)
+
+    def forward_batch(self, block_embeddings, global_embeddings, progresses):
+        """Batched form of forward: [N, hidden] block/global embeddings +
+        [N] progress -> [N, num_aspects] logits. Used by ppo_update to
+        replace a per-transition Python loop (the dominant cost of a PPO
+        update -- ~90% of iteration wall time measured directly, dwarfing
+        rollout collection) with one batched matmul per epoch."""
+        x = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
+        return self.mlp(x)
+
+
+class PositionCNN(nn.Module):
+    """Takes occupancy + cluster_grid + wiremask as spatial channels. Of
+    these, wiremask is the only one carrying an actual wirelength signal --
+    occupancy/cluster_grid say where placement is legal/clustered, not where
+    it's cheap; without it the policy has to infer HPWL-good positions
+    purely from the (spatially-uniform) block embedding broadcast below,
+    with no explicit geometric hint. See rl/env.py's wiremask() docstring."""
+
+    def __init__(self, hidden_dim: int, cnn_channels: int = 16, conv_width: int = 32, map_channels: int = 3):
+        super().__init__()
+        self.embed_proj = nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, cnn_channels)
+        self.conv1 = nn.Conv2d(map_channels + cnn_channels, conv_width, 3, padding=1)
+        self.conv2 = nn.Conv2d(conv_width, conv_width, 3, padding=1)
+        self.conv3 = nn.Conv2d(conv_width, 1, 1)
+
+    def forward(self, occupancy, cluster_grid, wiremask, block_embedding, global_embedding, progress):
+        g = occupancy.shape[0]
+        ctx = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
+        emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
+        x = _spatial(occupancy, cluster_grid, wiremask, batched=False)
+        x = torch.cat([x, emb_map], dim=0).unsqueeze(0)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return self.conv3(x)[0, 0]
+
+    def forward_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                       global_embeddings, progresses):
+        """Batched form of forward: [N, g, g] spatial channels + [N, hidden]
+        embeddings + [N] progress -> [N, g, g] logits. Conv2d already
+        natively supports a batch dimension -- forward() above just always
+        used batch size 1 (see ppo_update's per-transition loop this
+        replaces)."""
+        n, g, _ = occupancy.shape
+        ctx = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
+        emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
+        x = _spatial(occupancy, cluster_grid, wiremask, batched=True)
+        x = torch.cat([x, emb_map], dim=1)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return self.conv3(x)[:, 0]
+
+
+class PositionUNet(nn.Module):
+    """Whole-canvas position head (10-04 experiment): same inputs and output
+    as PositionCNN, but two stride-2 downsamplings, three dilated 3x3 layers
+    (dilation 1/2/4) and a global-average term at 1/4 resolution, then
+    upsampling with skip connections, so every cell's score can depend on
+    the whole canvas (PositionCNN sees 5x5 cells)."""
+
+    def __init__(self, hidden_dim: int, cnn_channels: int = 16, width: int = 32, map_channels: int = 3):
+        super().__init__()
+        self.embed_proj = nn.Linear(hidden_dim * 2 + 1 + NUM_STEP_FEATS, cnn_channels)
+        self.inp = nn.Conv2d(map_channels + cnn_channels, width, 3, padding=1)
+        self.down1 = nn.Conv2d(width, width, 3, stride=2, padding=1)
+        self.down2 = nn.Conv2d(width, width, 3, stride=2, padding=1)
+        self.mid = nn.ModuleList([nn.Conv2d(width, width, 3, padding=d, dilation=d) for d in (1, 2, 4)])
+        self.glob = nn.Linear(width, width)
+        self.up2 = nn.Conv2d(width, width, 3, padding=1)
+        self.up1 = nn.Conv2d(width, width, 3, padding=1)
+        self.out = nn.Conv2d(width, 1, 1)
+
+    def _net(self, x):
+        c1 = F.relu(self.inp(x))
+        d1 = F.relu(self.down1(c1))
+        m = F.relu(self.down2(d1))
+        for conv in self.mid:
+            m = F.relu(conv(m)) + m
+        m = m + self.glob(m.mean(dim=(2, 3)))[:, :, None, None]
+        u = F.relu(self.up2(F.interpolate(m, size=d1.shape[2:], mode="nearest") + d1))
+        u = F.relu(self.up1(F.interpolate(u, size=c1.shape[2:], mode="nearest") + c1))
+        return self.out(u)[:, 0]
+
+    def forward(self, occupancy, cluster_grid, wiremask, block_embedding, global_embedding, progress):
+        g = occupancy.shape[0]
+        ctx = torch.cat([block_embedding, global_embedding, _ctx1(progress)], dim=0)
+        emb_map = self.embed_proj(ctx).view(-1, 1, 1).expand(-1, g, g)
+        x = torch.cat([_spatial(occupancy, cluster_grid, wiremask, batched=False), emb_map], dim=0)
+        return self._net(x.unsqueeze(0))[0]
+
+    def forward_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                      global_embeddings, progresses):
+        n, g, _ = occupancy.shape
+        ctx = torch.cat([block_embeddings, global_embeddings, _ctxN(progresses)], dim=-1)
+        emb_map = self.embed_proj(ctx).view(n, -1, 1, 1).expand(-1, -1, g, g)
+        x = torch.cat([_spatial(occupancy, cluster_grid, wiremask, batched=True), emb_map], dim=1)
+        return self._net(x)
+
+
+class ScalarHead(nn.Module):
+    """Shared shape for ValueNet and RewardApproxNet: pooled graph embedding
+    + progress + reward committed so far this rollout -> scalar.
+
+    The third input matters more than it looks: `global_embedding` is fixed
+    per instance and `progress` is a deterministic function of how many
+    blocks have been placed (rl/ordering.py's order never depends on which
+    action was taken) -- so without `reward_so_far`, two different rollouts
+    of the SAME instance at the SAME step are otherwise indistinguishable
+    to this head, no matter how differently the placement actually went.
+    That left the value head unable to explain any of return_to_go's
+    within-episode variance, which a live diagnostic (2026-09-14) measured
+    at 10x-300x (avg ~44x-82x across two instances) the size of the actual
+    per-step signal PPO's advantage is supposed to isolate -- see
+    rl/ppo.py's ppo_update and algorithm.md's "Reward" section."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim + 2 + NUM_STEP_FEATS, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, global_embedding, progress, reward_so_far):
+        c = _ctx1(progress)
+        x = torch.cat([global_embedding, c[:1], reward_so_far.view(1), c[1:]], dim=0)
+        return self.mlp(x).squeeze(-1)
+
+    def forward_batch(self, global_embeddings, progresses, rewards_so_far):
+        """Batched form of forward: [N, hidden] embeddings + [N] progress/
+        reward_so_far -> [N] scalars."""
+        c = _ctxN(progresses)
+        x = torch.cat([global_embeddings, c[:, :1], rewards_so_far.unsqueeze(-1), c[:, 1:]], dim=-1)
+        return self.mlp(x).squeeze(-1)
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_gnn_layers: int = 3,
+                 num_aspects: int = 9, cnn_channels: int = 16):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.encoder = NetlistEncoder(hidden_dim=hidden_dim, num_layers=num_gnn_layers)
+        self.aspect_head = AspectHead(hidden_dim, num_aspects)
+        map_channels = 4 if TARGET_MAP else 3
+        pos_cls = PositionUNet if POS_NET == "unet" else PositionCNN
+        self.position_cnn = pos_cls(hidden_dim, cnn_channels=cnn_channels, map_channels=map_channels)
+        self.value_head = ScalarHead(hidden_dim)
+        self.reward_approx_head = ScalarHead(hidden_dim)
+
+    def encode(self, block_feats, pin_feats, b2b_edges, p2b_edges):
+        """Run once per episode; returns (block_embeddings, global_embedding)."""
+        h_block, _ = self.encoder(block_feats, pin_feats, b2b_edges, p2b_edges)
+        global_embedding = h_block.mean(dim=0)
+        return h_block, global_embedding
+
+    def aspect_logits(self, block_embeddings, global_embedding, block_idx, progress):
+        return self.aspect_head(block_embeddings[block_idx], global_embedding, progress)
+
+    def position_logits(self, occupancy, cluster_grid, wiremask, block_embeddings, global_embedding,
+                         block_idx, progress):
+        return self.position_cnn(occupancy, cluster_grid, wiremask, block_embeddings[block_idx],
+                                  global_embedding, progress)
+
+    def value(self, global_embedding, progress, reward_so_far):
+        return self.value_head(global_embedding, progress, reward_so_far)
+
+    def reward_approx(self, global_embedding, progress, reward_so_far):
+        return self.reward_approx_head(global_embedding, progress, reward_so_far)
+
+    def aspect_logits_batch(self, block_embeddings, global_embeddings, progresses):
+        """block_embeddings: [N, hidden] (already gathered per-transition by
+        the caller, since each transition may come from a different episode
+        with its own block embedding table); global_embeddings: [N, hidden];
+        progresses: [N]. See AspectHead.forward_batch."""
+        return self.aspect_head.forward_batch(block_embeddings, global_embeddings, progresses)
+
+    def position_logits_batch(self, occupancy, cluster_grid, wiremask, block_embeddings,
+                               global_embeddings, progresses):
+        return self.position_cnn.forward_batch(occupancy, cluster_grid, wiremask, block_embeddings,
+                                                global_embeddings, progresses)
+
+    def value_batch(self, global_embeddings, progresses, rewards_so_far):
+        return self.value_head.forward_batch(global_embeddings, progresses, rewards_so_far)
+
+    def reward_approx_batch(self, global_embeddings, progresses, rewards_so_far):
+        return self.reward_approx_head.forward_batch(global_embeddings, progresses, rewards_so_far)
+
+
+_STEP_FEAT_KEYS = ("aspect_head.mlp.0.weight", "position_cnn.embed_proj.weight",
+                   "value_head.mlp.0.weight", "reward_approx_head.mlp.0.weight")
+
+
+def load_state(net: nn.Module, path: str) -> nn.Module:
+    """load_state_dict from `path`, first appending zero step-feature input
+    columns to checkpoints saved before NUM_STEP_FEATS existed (same as
+    scripts/migrate_checkpoint_step_features.py; behaviour unchanged)."""
+    sd = torch.load(path, map_location="cpu")
+    target = net.state_dict()
+    for k in _STEP_FEAT_KEYS:
+        if k in sd and sd[k].shape[1] + NUM_STEP_FEATS == target[k].shape[1]:
+            sd[k] = torch.cat([sd[k], torch.zeros(sd[k].shape[0], NUM_STEP_FEATS)], dim=1)
+    net.load_state_dict(sd)
+    return net

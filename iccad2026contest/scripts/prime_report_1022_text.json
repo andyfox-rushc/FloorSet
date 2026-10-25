@@ -1,0 +1,76 @@
+{
+  "title": "Team ICB on FloorSet-Prime: RL tree builder + pair re-cut refinement (RPolyPlan / JigsawPlanner stages in progress)",
+  "subtitle": "10/21-10/23/2026  |  all 100 test designs  |  updated 10/23",
+  "short": {
+    "Packer flow": "Packer",
+    "Packer + refine": "Pack+R",
+    "Partition (10/20)": "Part 10/20",
+    "Partition (t80, cache fixed)": "Partition",
+    "Partition + refine": "Part+R",
+    "Partition + refine in restarts": "Part+R2",
+    "Partition + refine + tree policy": "RL",
+    "Final (best of all + polish)": "Final",
+    "Final 10/22 night": "Night",
+    "Partition (pocket fix 10/23)": "Pocket fix"
+  },
+  "summary": [
+    "Where the numbers come from: the final layout of each design is the best of several flows, then polished by the pair re-cut refinement (stage 3 of the RPolyPlan / JigsawPlanner plan, random kicks). The reinforcement-learning tree builder is in it: its flow ('RL' in the tables) gives 59 of the 100 final layouts. The RL kick policy is not used (it lost to random kicks), and stages 1-2 of the plan (global floorplan and grid assignment) are not used (their layouts were rarely valid).",
+    "RL tree builder against the same flow started from the seed tree (both with refinement in every restart, all 100 designs): better on 47 designs, worse on 4, equal on 48 (design 75 is invalid in both); mean cost 1.0069 vs 1.0234; wirelength 2.2% below the ground truth vs 0.2% above it; 76 designs at 1.000 vs 48.",
+    "AUTO"
+  ],
+  "sections": [
+    {
+      "h": "The plan",
+      "p": [
+        "Prime's ground truth tiles its frame exactly (zero white space) with rectilinear blocks, and 85 of the 100 test layouts cannot be built from straight cuts alone. The plan agreed on 10/21 combines two published rectilinear floorplanners with reinforcement learning (RL), inside a mix of methods whose best layout is picked per design:",
+        "1. Global floorplan in the style of RPolyPlan (arXiv 2610.28276): an augmented-Lagrangian optimization of soft-block boxes with pairwise overlap sharing, inside the exact frame.",
+        "2. Legalization in the style of JigsawPlanner (ICCAD 2024): Prime's coordinates and areas are integers, so unit grid cells can give every block its exact area with no white space and no overlap.",
+        "3. Clean-up moves that keep areas exact, chosen by an RL policy instead of hand-written rules.",
+        "Alongside: (A) an RL policy that builds the slicing tree for the existing zero-white-space partition flow."
+      ]
+    },
+    {
+      "h": "What was built overnight, and what worked",
+      "p": [
+        "Regression fix. A cache cap added on 10/21 to share the machine with Vivado made the partition search clear its cache constantly; big designs failed or lost 0.3-0.6. The old size is the default again (about 6 GB for 6 workers), and the full partition run was redone with it ('Partition' column).",
+        "Stages 1-2 (grid flow, prime_grid.py). The augmented-Lagrangian global floorplan and the exact grid assignment (a transportation linear program solved with HiGHS) both work end to end, and their wirelength is good (about 6% over the ground truth). But stage 1 does not converge at 0% white space, the cell assignment leaves staircase edges that break the 16-corner cap, and clusters split, so few layouts came out valid. This flow is parked; its parts are reusable.",
+        "Stage 3 on the partition flow (rl/refine.py) -- the night's main gain. Instead of legalizing a grid, the stage-3 moves were applied to the partition flow's already-valid layouts: two touching soft blocks are merged and re-split by one straight cut at the exact area of each; a rigid block and a soft neighbour swap places within their joint region; three soft blocks are re-split by two cuts. Areas stay exact and white space stays zero. A move is kept if it lowers a stand-in for the contest cost (wirelength and soft violations). Pairs are re-cut independently of the tree, so layouts leave the slicing family. Greedy descent is followed by iterated local search: a few random re-cuts ('kicks'), descend again, keep only improvements.",
+        "RL in stage 3 (rl/kick_policy.py). A small network scores candidate re-cuts from local features (immediate gain, distance of each block from where its nets pull it, net weight between the pair, soft violations) and samples the kicks of the iterated local search; REINFORCE, comparing several kicks from the same state. v1 (111 training designs, re-scoring every candidate after each move) tied with random kicks on 5 held-out designs; v2 (one scoring pass over 60 sampled pairs per kick, trained from a pool of 150 training layouts) lost on 14 of 19 held-out designs (mean 1.018 vs 1.011 for random kicks at equal time). Random kicks stay in use.",
+        "RL tree builder (A, rl/tree_policy.py). The partition annealer used to start from a tree that is invalid on most large designs (41-51 bad leaves on test designs 60 and 90), mostly because rigid blocks ended up as siblings. The policy builds the tree top-down over the real region, masks splits that leave a rigid-only subtree or a bad leaf, and learns sort keys, cut directions and split points by REINFORCE against the mean of 8 sampled trees per design (best validation tree cost 8.56, against 21.7 for the old first tree). Each restart starts its search from the best of 32 sampled trees. Its first A/B looked like a loss (2 of 12 layouts invalid), but both failures came from the refiner's polygon output (1e-6 coordinate jogs, a collinear vertex), fixed on 10/22 together with a guard that checks every refined layout. A first full run then crashed on 17 designs from a refiner sliver bug, and the crash also switched the restarts to serial; both were fixed and those designs rerun."
+      ]
+    },
+    {
+      "h": "Bugs fixed on 10/22",
+      "p": [
+        "Refiner output: coordinates closer than 1e-5 are merged (rigid blocks keep their exact values), collinear vertices removed, cuts leaving pieces thinner than 0.001 rejected; every refined layout is checked against the evaluator's hard rules, with the unrefined one as fallback.",
+        "Evaluator shape check (rl/polygon.py canonical_key): float noise from a fractional position left a duplicate vertex, so an exact fixed shape read as different; the ground truth still scores 1.000 on all 100 designs.",
+        "A crashing restart made the restart pool fall back to serial for the rest of the run (4x slower); restarts now catch their own errors.",
+        "Targeted pushes for edge-pin misses and split clusters (rl/refine.py fix_violations): fixed designs 66 and 70 (to 1.000); blocks walled in by preplaced or rigid blocks (designs 50, 80, 81, 93, 98) still miss their edge."
+      ]
+    },
+    {
+      "h": "Fixes on 10/23",
+      "p": [
+        "Design 75 (1.289 -> 1.003): a 5 x 7 pocket walled in by preplaced blocks could only be filled by a member of a soft MIB group of area 35, but MIB groups got a fixed 1.5-aspect rectangle that never fit. A rectangular pocket now gives a matching MIB group its shape (rl/partition.py _fill_pockets).",
+        "Design 77 (1.157 -> 1.041): the solve-time pick (prime_evaluate.relative_cost, and rl/repack.py contest_relative_cost) added ratios where the contest adds gaps; the base near 2 doubled the weight of soft violations and chose the packer layout over a better partition one. With gaps the pick equals picking with the ground truth (1.010 both). The original Lite contest repo has the same function and was not changed.",
+        "Edge pins and clusters behind walls: a beam-search 'route push' lets a block go around preplaced or rigid blocks (it fixed the split cluster of design 81, 1.044 -> 1.005); designs 50, 77, 80 and 98 have no valid sequence of pair moves to their edge and need a new move (e.g. swapping with a block already on the edge). A shape check now rejects moves that leave a self-touching ring (design 80).",
+        "Grid flow: starting stage 1 with 10% slack and shrinking it to zero does not help; it stalls at the same violation, so its formulation needs rework.",
+        "RL tree builder with a reward closer to its use (cost after a short anneal from each sampled tree, 6 designs in parallel): no gain on unseen designs. Round 1 (1.5 s timed anneals) lost a fair paired test, worse on 18 of 30 held-out designs; the timed anneal made the reward follow machine load. Round 2 (3,000-step deterministic anneals) improved its 30 validation designs (cost ratio to the seed tree 1.003 -> 0.889) but tied the current policy on 30 fresh held-out designs (15 better, 15 worse; mean 3.514 vs 3.458): the checkpoint choice fitted the validation set. The 10/21 policy stays in use. A real gain likely needs far more updates than the 101-355 a 1.5-hour run allows."
+      ]
+    }
+  ],
+  "table_note": "Quality cost per design (the contest cost without its runtime term). 1.000 is the ground truth's own score and also the floor: gaps below zero count as zero, so a design at 1.000 matches or beats the ground truth. 'HPWL gap' is the best layout's wirelength relative to the ground truth (negative = shorter). 'Picked' is the flow the best-of chose without looking at the ground truth.",
+  "anchor_note": "The five anchor designs (0, 24, 49, 74 and 98, spread over the size range) drawn at one scale: the ground truth, the partition flow before refinement, and the final layout (green frame).",
+  "after": [
+    {
+      "h": "Next steps",
+      "p": [
+        "1. Edge pins on designs 50, 77, 80 and 98: a move that swaps a block with one already on the required edge, neighbours absorbing the area difference.",
+        "2. RL tree builder: longer training with the fixed-step anneal reward and a larger held-out set for choosing checkpoints.",
+        "3. The grid flow (stages 1-2): reformulate the global floorplan's area sharing so it converges at zero white space.",
+        "4. Port the pick-rule fix (gaps, not ratios) to the Lite contest repo if you want it there.",
+        "5. Runtime: refinement is anytime; the contest budget decides how long it runs."
+      ]
+    }
+  ]
+}

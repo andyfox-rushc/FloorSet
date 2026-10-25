@@ -1,0 +1,453 @@
+{
+ "title": "Team ICB on FloorSet-Prime: all 100 test designs at the ground truth's cost",
+ "subtitle": "10/21-10/25/2026  |  all 100 test designs  |  updated 10/25",
+ "short": {
+  "Packer flow": "Packer",
+  "Packer + refine": "Pack+R",
+  "Partition (10/20)": "Part 10/20",
+  "Partition (t80, cache fixed)": "Part",
+  "Partition + refine": "P+R",
+  "Partition + refine in restarts": "P+R2",
+  "Partition + refine + tree policy": "RL",
+  "Final (best of all + polish)": "Final",
+  "Final 10/22 night": "Night",
+  "Partition (pocket fix 10/23)": "Pocket fix",
+  "Final 10/23 (best of all + polish)": "10/23",
+  "Final 10/24 (+ repairs + LNS)": "10/24",
+  "LNS window re-partition 10/24": "LNS",
+  "Partition + cluster shift 10/24": "Shift",
+  "Pocket swap 10/24": "Pocket",
+  "Partition (RL tree) + LNS 10/24": "RL+LNS",
+  "Final 10/25 (10/24 + wirelength round + rebuild)": "10/25",
+  "Rebuild 10/25 (reproduce_final.sh)": "Rbld",
+  "Partition + refine + tree policy + LNS (wirelength) 10/24": "RL+WL",
+  "Final 10/22 night + LNS (wirelength) 10/24": "Night+WL",
+  "LNS window re-partition 10/24 + LNS (wirelength) 10/24": "LNS+WL",
+  "Partition + cluster shift 10/24 + LNS (wirelength) 10/24": "Shift+WL",
+  "Pocket swap 10/24 + LNS (wirelength) 10/24": "Pocket+WL",
+  "Partition (RL tree) + LNS 10/24 + LNS (wirelength) 10/24": "RL+L+WL",
+  "Edge-contact repair + LNS 10/24": "Edge fix",
+  "Partition + refine + LNS 10/24 (edge contact)": "P+R+LNS",
+  "Rebuild 10/25 (Partition + refine + tree policy + LNS)": "RbRL+LNS",
+  "Rebuild 10/25 (Partition + refine + tree policy)": "Rb RL",
+  "Rebuild 10/25 (Partition + refine + LNS)": "RbP+R+L",
+  "Partition + refine + tree policy + LNS": "RL+LNS",
+  "Partition + refine + LNS": "P+R+LNS"
+ },
+ "summary": [
+  "AUTO",
+  "Where the numbers come from. On 10/25 the full rebuild from scratch (scripts/reproduce_final.sh, 12.7 h of wall clock) reached all 100 designs at 1.000 with no hand-run step; see the next section. The final column is final_1025.json: the 10/24 result after a wirelength round (window LNS, 900 s on every design; 97 got shorter), with 14 designs taken from the rebuild where its wirelength is shorter. A layout was swapped in only if the evaluator found it valid, with no more soft violations and shorter wirelength. The 10/24 result itself was the 10/23 best-of-six-flows (picked without the ground truth, then a 60 s polish) plus repair moves and LNS rounds on 17 designs; the sections below keep that history.",
+  "Read the 1.000s with two caveats. The cost is floored at 1.000, so these designs match or beat the ground truth; on wirelength the closest is design 76 at 0.16% below it, then 29 and 81 at 0.4%. And the search time of the LNS stage was steered with the ground truth: in the 10/24 rounds and in the rebuild's last step a design leaves the queue once its contest cost reaches 1.000 (the 10/24 wirelength round ran a fixed 900 s on every design instead). Every decision to keep a layout used only our own measures (wirelength and violation counts), but a contest run would have to stop on its own rule. The recorded run time per design is now 1,503 s on average (about 42 CPU-hours in all, mostly the wirelength round); the rebuild alone records 298 s. Run time was not the focus."
+ ],
+ "sections": [
+  {
+   "h": "10/24-25: a wirelength round, and the full rebuild from scratch",
+   "p": [
+    "The rebuild ran the eight steps of scripts/reproduce_final.sh on 10/24-25 with the 10/24 code changes (below). Steps 1-2 landed within 0.01 of the runs they replace, steps 3-6 beat them by 0.10-0.13; all eight outputs are 100/100 valid. Most likely the refiner output fix is the cause (layouts no longer lose an edge or cluster contact when converted back), though this was not isolated.",
+    [
+     "table",
+     [
+      "Step",
+      "Output",
+      "Rebuild",
+      "Before",
+      "At 1.000",
+      "Time"
+     ],
+     [
+      [
+       "1",
+       "Packer",
+       "1.2318",
+       "1.2247",
+       "0",
+       "1 h 41"
+      ],
+      [
+       "2",
+       "Packer + refine",
+       "1.1427",
+       "1.1425",
+       "0",
+       "0 h 50"
+      ],
+      [
+       "3",
+       "Partition",
+       "1.1953",
+       "1.2915",
+       "0",
+       "2 h 13"
+      ],
+      [
+       "4",
+       "Partition + refine",
+       "1.0187",
+       "1.1462",
+       "50",
+       "0 h 50"
+      ],
+      [
+       "5",
+       "Partition + refine in restarts",
+       "1.0199",
+       "1.1229",
+       "46",
+       "2 h 42"
+      ],
+      [
+       "6",
+       "Partition + refine + tree policy",
+       "1.0071",
+       "1.1077",
+       "75",
+       "2 h 43"
+      ],
+      [
+       "7",
+       "Best of flows + polish",
+       "1.0016",
+       "1.0054",
+       "86",
+       "0 h 34"
+      ],
+      [
+       "8",
+       "Repairs + LNS (stop at 1.000)",
+       "1.0000",
+       "1.0000",
+       "100",
+       "1 h 06"
+      ]
+     ],
+     [
+      0.07,
+      0.37,
+      0.12,
+      0.12,
+      0.12,
+      0.12
+     ]
+    ],
+    "The first run of step 8 ended at 1.0001: design 50 kept its edge-pin miss (1.057) for all six rounds. The cause was a 10/24 change to the pocket swap: it returned the first annealing run that put block 9 on its corner even when that layout, after the greedy descent, scored worse than the start (1.068 against 1.057), so the repair was rejected and no other seed was tried. It now stops early only on a result with fewer violations and a lower score, and otherwise keeps the best; it then fixed design 50 in 6 of 6 standalone runs. Step 8 was rerun (1 h 6 min): design 50 reached 1.000 in the first round, and only 76 needed a second.",
+    "Code changes on 10/24, all in the rebuild. Faster LNS: windows of 6-14 blocks, 1 s anneals, and don't-look bits in the greedy descent after each window (a move whose blocks have not changed since it last failed is skipped; the descent was 80% of LNS time). On four large designs at 600 s that gave 749 windows instead of 208 and 6.4% shorter wirelength instead of 5.1%. Edge contact: an edge pin now needs at least 1e-3 of contact along the edge, not a sliver; designs 23 and 73 of the 10/24 file met theirs only through a 1e-6 sliver and were repaired (23 by the repair moves, 73 by LNS from its partition + refine layout). Refiner output: when merging near-equal coordinates broke a contact or made blocks overlap (designs 25, 31, 33 and 62), it now keeps those blocks' exact shapes.",
+    [
+     "table",
+     [
+      "File",
+      "Weighted",
+      "At 1.000",
+      "HPWL gap",
+      "Within 1%",
+      "Closest"
+     ],
+     [
+      [
+       "final_1024 (10/24)",
+       "1.0000",
+       "100",
+       "-3.13%",
+       "29",
+       "-0.05%"
+      ],
+      [
+       "Rebuild final_lns",
+       "1.0000",
+       "100",
+       "-3.24%",
+       "23",
+       "-0.04%"
+      ],
+      [
+       "final_1024 + wirelength round",
+       "1.0000",
+       "100",
+       "-4.06%",
+       "13",
+       "-0.16%"
+      ],
+      [
+       "final_1025 (+ 14 from rebuild)",
+       "1.0000",
+       "100",
+       "-4.17%",
+       "9",
+       "-0.16%"
+      ]
+     ],
+     [
+      0.37,
+      0.12,
+      0.12,
+      0.13,
+      0.12,
+      0.12
+     ]
+    ],
+    "'HPWL gap' is the mean wirelength against the ground truth (negative = shorter); 'Within 1%' counts designs less than 1% below it, the thin margins. The last three pass the strict edge-contact check and a round trip through the refiner; final_1024 fails both on designs 23 and 73 (sliver contacts)."
+   ]
+  },
+  {
+   "h": "10/24: window re-partition and large-neighbourhood search (rl/window.py)",
+   "p": [
+    "The partition flow's annealer (slicing tree over the soft blocks, rigid blocks placed in corners, cuts that wrap around preplaced blocks) can also run on part of a layout: the union of the blocks a window touches is the region, and all other blocks stay put as fixed context for wirelength and violations. Four moves are built on it; each keeps its result only if our score (wirelength against the starting layout and soft violations) drops.",
+    "Window re-partition for an edge pin (design 80, 1.054). Block 81, a long strip, had to touch the bottom edge 94 units away, through a band of blocks no pair move could cross. The window spans the strip from the block to its edge, widened in steps; a small search-only penalty on the block's distance to its edge steers the annealer. Valid with the pin met, then LNS: 1.000.",
+    "Pocket swap (design 50, 1.057). Block 9 must touch the top-right corner, which lies in a pocket walled off by two preplaced blocks and the frame, filled exactly by two other blocks. No re-shaping can reach it: the pocket has to be refilled. Its area (534) is block 9 (406) plus 128, matched within the 1% area tolerance only by a block of the MIB pair 5/6 (132). The move fills the pocket with block 9 plus such a partner, and re-partitions a window of the main region so the two displaced blocks (one with a top-edge pin of its own) take the space it left: 1.000. Only one of about 35 annealing runs found a valid layout with every pin met, so this move is hit and miss.",
+    "Cluster shift (design 8, 1.028). Its zero-white-space layout scored 1.125 on one split cluster: a rigid MIB pair sat 22 units below its preplaced cluster mate, and one of the pair is pinned to the right edge, so it fits in one spot only. Moving the pair as a unit until it touches its mate, fixing it there and re-partitioning the window around both places gives 1.000 (wirelength 16% below the ground truth). A window search with a penalty on the split alone never found it (the annealer kept trading the split for the edge pin).",
+    "LNS for wirelength (14 designs). A random block, a window grown around it to 6-20 blocks, 3 s of annealing (6-14 blocks and 1 s in the rebuild), a greedy descent, and the result kept only if the score drops; repeated until the time is up (3.4% of the 10,691 windows tried won, more early on, fewer late). One 900 s run took design 97 from 1.012 to 1.000; 13 more designs followed in rounds of 900-2,400 s, several seeds in parallel. On design 76 the packer layout picked on 10/23 (1.041) has 5.6% white space that LNS cannot remove; started instead from its zero-white-space partition layout (1.047, one split cluster), LNS rejoined the cluster and then cut wirelength over six rounds to 0.1% below the ground truth.",
+    "Corridor re-slice (10/23 evening; designs 77 and 98). An edge-pinned block and a chain of soft blocks between it and its edge (or the band of blocks in that strip) are merged and re-cut by random slicing trees with the block on the edge side; the best few get a greedy descent. It fixed 77 (1.041 to 1.000) and 98 (1.029 to 1.002), but not 50 and 80, which needed the moves above.",
+    [
+     "table",
+     [
+      "ID",
+      "Blocks",
+      "10/23",
+      "HPWL",
+      "Soft viol.",
+      "10/24",
+      "HPWL",
+      "Fixed by"
+     ],
+     [
+      [
+       "98",
+       "119",
+       "1.0285",
+       "+0.0056",
+       "1 boundary",
+       "1.0000",
+       "-0.0051",
+       "corridor (10/23 eve) + LNS"
+      ],
+      [
+       "97",
+       "118",
+       "1.0120",
+       "+0.0241",
+       "-",
+       "1.0000",
+       "-0.0006",
+       "LNS"
+      ],
+      [
+       "87",
+       "108",
+       "1.0003",
+       "+0.0006",
+       "-",
+       "1.0000",
+       "-0.0091",
+       "LNS"
+      ],
+      [
+       "86",
+       "107",
+       "1.0037",
+       "+0.0073",
+       "-",
+       "1.0000",
+       "-0.0068",
+       "LNS"
+      ],
+      [
+       "83",
+       "104",
+       "1.0127",
+       "+0.0253",
+       "-",
+       "1.0000",
+       "-0.0025",
+       "LNS"
+      ],
+      [
+       "81",
+       "102",
+       "1.0052",
+       "+0.0103",
+       "-",
+       "1.0000",
+       "-0.0018",
+       "LNS"
+      ],
+      [
+       "80",
+       "101",
+       "1.0542",
+       "+0.0332",
+       "1 boundary",
+       "1.0000",
+       "-0.0073",
+       "window + LNS"
+      ],
+      [
+       "77",
+       "98",
+       "1.0409",
+       "+0.0046",
+       "1 boundary",
+       "1.0000",
+       "-0.0005",
+       "corridor (10/23 eve)"
+      ],
+      [
+       "76",
+       "97",
+       "1.0410",
+       "+0.0258",
+       "-",
+       "1.0000",
+       "-0.0011",
+       "LNS on partition layout"
+      ],
+      [
+       "75",
+       "96",
+       "1.0033",
+       "+0.0065",
+       "-",
+       "1.0000",
+       "-0.0212",
+       "LNS"
+      ],
+      [
+       "63",
+       "84",
+       "1.0012",
+       "+0.0024",
+       "-",
+       "1.0000",
+       "-0.0183",
+       "LNS"
+      ],
+      [
+       "50",
+       "71",
+       "1.0571",
+       "-0.0176",
+       "1 boundary",
+       "1.0000",
+       "-0.0218",
+       "pocket swap"
+      ],
+      [
+       "48",
+       "69",
+       "1.0282",
+       "+0.0564",
+       "-",
+       "1.0000",
+       "-0.0044",
+       "LNS"
+      ],
+      [
+       "36",
+       "57",
+       "1.0066",
+       "+0.0132",
+       "-",
+       "1.0000",
+       "-0.0020",
+       "LNS"
+      ],
+      [
+       "29",
+       "50",
+       "1.0008",
+       "+0.0016",
+       "-",
+       "1.0000",
+       "-0.0033",
+       "LNS"
+      ],
+      [
+       "15",
+       "36",
+       "1.0038",
+       "+0.0076",
+       "-",
+       "1.0000",
+       "-0.0036",
+       "LNS"
+      ],
+      [
+       "8",
+       "29",
+       "1.0275",
+       "-0.1051",
+       "-",
+       "1.0000",
+       "-0.1617",
+       "cluster shift"
+      ]
+     ],
+     [
+      0.06,
+      0.07,
+      0.08,
+      0.09,
+      0.13,
+      0.08,
+      0.09,
+      0.3
+     ]
+    ],
+    "Reproduction: scripts/reproduce_final.sh ends with this stage (scripts/lns_final.py): per design it starts from both the polished pick and the best zero-white-space flow layout, repairs violations, runs LNS rounds, and keeps the cheapest on the contest formula relative to the polished pick (no ground truth). It uses the same stop-at-1.000 time allocation as above. The full rebuild was run on 10/24-25 (section above)."
+   ]
+  },
+  {
+   "h": "The plan",
+   "p": [
+    "Prime's ground truth tiles its frame exactly (zero white space) with rectilinear blocks, and 85 of the 100 test layouts cannot be built from straight cuts alone. The plan agreed on 10/21 combines two published rectilinear floorplanners with reinforcement learning (RL), inside a mix of methods whose best layout is picked per design:",
+    "1. Global floorplan in the style of RPolyPlan (arXiv 2610.28276): an augmented-Lagrangian optimization of soft-block boxes with pairwise overlap sharing, inside the exact frame.",
+    "2. Legalization in the style of JigsawPlanner (ICCAD 2024): Prime's coordinates and areas are integers, so unit grid cells can give every block its exact area with no white space and no overlap.",
+    "3. Clean-up moves that keep areas exact, chosen by an RL policy instead of hand-written rules.",
+    "Alongside: (A) an RL policy that builds the slicing tree for the existing zero-white-space partition flow."
+   ]
+  },
+  {
+   "h": "What was built overnight, and what worked (history)",
+   "p": [
+    "Regression fix. A cache cap added on 10/21 to share the machine with Vivado made the partition search clear its cache constantly; big designs failed or lost 0.3-0.6. The old size is the default again (about 6 GB for 6 workers), and the full partition run was redone with it ('Partition' column).",
+    "Stages 1-2 (grid flow, prime_grid.py). The augmented-Lagrangian global floorplan and the exact grid assignment (a transportation linear program solved with HiGHS) both work end to end, and their wirelength is good (about 6% over the ground truth). But stage 1 does not converge at 0% white space, the cell assignment leaves staircase edges that break the 16-corner cap, and clusters split, so few layouts came out valid. This flow is parked; its parts are reusable.",
+    "Stage 3 on the partition flow (rl/refine.py) -- the night's main gain. Instead of legalizing a grid, the stage-3 moves were applied to the partition flow's already-valid layouts: two touching soft blocks are merged and re-split by one straight cut at the exact area of each; a rigid block and a soft neighbour swap places within their joint region; three soft blocks are re-split by two cuts. Areas stay exact and white space stays zero. A move is kept if it lowers a stand-in for the contest cost (wirelength and soft violations). Pairs are re-cut independently of the tree, so layouts leave the slicing family. Greedy descent is followed by iterated local search: a few random re-cuts ('kicks'), descend again, keep only improvements.",
+    "RL in stage 3 (rl/kick_policy.py). A small network scores candidate re-cuts from local features (immediate gain, distance of each block from where its nets pull it, net weight between the pair, soft violations) and samples the kicks of the iterated local search; REINFORCE, comparing several kicks from the same state. v1 (111 training designs, re-scoring every candidate after each move) tied with random kicks on 5 held-out designs; v2 (one scoring pass over 60 sampled pairs per kick, trained from a pool of 150 training layouts) lost on 14 of 19 held-out designs (mean 1.018 vs 1.011 for random kicks at equal time). Random kicks stay in use.",
+    "RL tree builder (A, rl/tree_policy.py). The partition annealer used to start from a tree that is invalid on most large designs (41-51 bad leaves on test designs 60 and 90), mostly because rigid blocks ended up as siblings. The policy builds the tree top-down over the real region, masks splits that leave a rigid-only subtree or a bad leaf, and learns sort keys, cut directions and split points by REINFORCE against the mean of 8 sampled trees per design (best validation tree cost 8.56, against 21.7 for the old first tree). Each restart starts its search from the best of 32 sampled trees. Its first A/B looked like a loss (2 of 12 layouts invalid), but both failures came from the refiner's polygon output (1e-6 coordinate jogs, a collinear vertex), fixed on 10/22 together with a guard that checks every refined layout. A first full run then crashed on 17 designs from a refiner sliver bug, and the crash also switched the restarts to serial; both were fixed and those designs rerun."
+   ]
+  },
+  {
+   "h": "Bugs fixed on 10/22 (history)",
+   "p": [
+    "Refiner output: coordinates closer than 1e-5 are merged (rigid blocks keep their exact values), collinear vertices removed, cuts leaving pieces thinner than 0.001 rejected; every refined layout is checked against the evaluator's hard rules, with the unrefined one as fallback.",
+    "Evaluator shape check (rl/polygon.py canonical_key): float noise from a fractional position left a duplicate vertex, so an exact fixed shape read as different; the ground truth still scores 1.000 on all 100 designs.",
+    "A crashing restart made the restart pool fall back to serial for the rest of the run (4x slower); restarts now catch their own errors.",
+    "Targeted pushes for edge-pin misses and split clusters (rl/refine.py fix_violations): fixed designs 66 and 70 (to 1.000); blocks walled in by preplaced or rigid blocks (designs 50, 80, 81, 93, 98) still miss their edge."
+   ]
+  },
+  {
+   "h": "Fixes on 10/23 (history)",
+   "p": [
+    "Design 75 (1.289 -> 1.003): a 5 x 7 pocket walled in by preplaced blocks could only be filled by a member of a soft MIB group of area 35, but MIB groups got a fixed 1.5-aspect rectangle that never fit. A rectangular pocket now gives a matching MIB group its shape (rl/partition.py _fill_pockets).",
+    "Design 77 (1.157 -> 1.041): the solve-time pick (prime_evaluate.relative_cost, and rl/repack.py contest_relative_cost) added ratios where the contest adds gaps; the base near 2 doubled the weight of soft violations and chose the packer layout over a better partition one. With gaps the pick equals picking with the ground truth (1.010 both). The original Lite contest repo has the same function and was not changed.",
+    "Edge pins and clusters behind walls: a beam-search 'route push' lets a block go around preplaced or rigid blocks (it fixed the split cluster of design 81, 1.044 -> 1.005); designs 50, 77, 80 and 98 have no valid sequence of pair moves to their edge and need a new move (e.g. swapping with a block already on the edge). A shape check now rejects moves that leave a self-touching ring (design 80).",
+    "Grid flow: starting stage 1 with 10% slack and shrinking it to zero does not help; it stalls at the same violation, so its formulation needs rework.",
+    "RL tree builder with a reward closer to its use (cost after a short anneal from each sampled tree, 6 designs in parallel): no gain on unseen designs. Round 1 (1.5 s timed anneals) lost a fair paired test, worse on 18 of 30 held-out designs; the timed anneal made the reward follow machine load. Round 2 (3,000-step deterministic anneals) improved its 30 validation designs (cost ratio to the seed tree 1.003 -> 0.889) but tied the current policy on 30 fresh held-out designs (15 better, 15 worse; mean 3.514 vs 3.458): the checkpoint choice fitted the validation set. The 10/21 policy stays in use. A real gain likely needs far more updates than the 101-355 a 1.5-hour run allows."
+   ]
+  }
+ ],
+ "table_note": "Quality cost per design (the contest cost without its runtime term). 1.000 is the ground truth's own score and also the floor: gaps below zero count as zero, so a design at 1.000 matches or beats the ground truth. 'HPWL gap' is the best layout's wirelength relative to the ground truth (negative = shorter). 'Picked' is the flow the best-of chose without looking at the ground truth. In 'Picked': WL = after the 10/24 wirelength round, Rb = taken from the 10/25 rebuild, L or LNS = window LNS, Part = partition flow, P+R = partition + refine (P+R2 in restarts), Rbld = the rebuild, RL = the reinforcement-learning tree builder's flow, Night = the 10/22 night run.",
+ "anchor_note": "The five anchor designs (0, 24, 49, 74 and 98, spread over the size range) drawn at one scale: the ground truth, the partition flow before refinement, and the final layout (green frame).",
+ "after": [
+  {
+   "h": "Next steps",
+   "p": [
+    "1. A stopping rule without the ground truth for the LNS stage (e.g. stop a design when a round improves it by less than a set amount), and the score that gives. The current rule never stops, since every design keeps gaining wirelength.",
+    "2. More margin where wirelength is within 0.5% of the ground truth (designs 76, 29, 81).",
+    "3. LNS speed: the greedy descent after each window is most of the time; one pair-move type (three-block re-cut) alone takes 58%. A compiled version (numba) is the next step.",
+    "4. RL: learn which window to re-partition (most LNS windows lose), in place of the random choice; training data comes free from every LNS run.",
+    "5. The grid flow (stages 1-2) still needs its global floorplan reformulated to converge at zero white space.",
+    "6. The pick-rule fix ported to the Lite contest repo still needs a full Lite evaluation (about 6 h).",
+    "7. Run time: every stage is anytime; the contest budget decides how long each runs."
+   ]
+  }
+ ]
+}

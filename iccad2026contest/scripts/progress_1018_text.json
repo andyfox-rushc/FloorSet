@@ -1,0 +1,275 @@
+{
+ "summary_note": "'Now (10/18)' = the solver as of 10/18: candidate layouts from the RL policy, five analytic placements and four learned placers -- placer A (centres), two independently trained relation networks (arrangement from predicted pairwise relations, or from predicted centres) -- the best one plus the four learned ones packed with 200 s of search per candidate at 77 blocks (was 100; scaled by (blocks/77)^2) with a shape refit halfway, then squeeze and wirelength relaxation; soft blocks may be up to 16:1; new, every packer result gets an exact cluster repair, and the packer search is steered toward joining split clusters; layouts kept inside the pin box within 5% of the best cost; new on 10/17, the winning layout gets a second packer round with a search penalty for running past the outline revealed by preplaced edge blocks, kept only if cheaper; new on 10/18, while the best layout still breaks a soft constraint the whole solve is repeated (up to 3 runs, the reruns also aim for that outline) and the cheapest run is kept. Measured with the contest evaluator (iccad2026_evaluate.py --evaluate), one design at a time. '10/17', '10/16', '10/15' = earlier reports. Weighted score = official total (exp(blocks/12) weights). Runtime 641 s per design on average (405 s on 10/17): we traded time for quality and can speed it up later.",
+ "work": [
+  [
+   "Repeat the solve while violations remain (10/17 - 10/18)",
+   "Single designs vary a lot from run to run (design 11: 1.007 to 1.184 over five runs), and the breakdown shows why: on small designs one edge violation costs 3-8%, and on some designs it appears in one run and not in the next. Aiming the first packer round at the outline, and plain best-of-two runs, were both within the noise on 7 test designs (1.091-1.110 vs 1.094). What works is targeted: when the best layout still has a soft violation (counted exactly by the solver, no ground truth needed), the whole solve runs again with new random seeds, and the reruns add packer runs that aim for the outline revealed by preplaced edge blocks; at most 3 runs, cheapest kept, and a clean layout stops immediately (design 0 still takes one run). Official: 1.0404 -> 1.0343, vrel 0.008 -> 0.004, designs with any violation 26 -> 17, the 10 largest designs 1.040 -> 1.029. Better than the ground truth's own score on 76 of 100 designs (77 on 10/17): new wins on 11, 12 and 83; lost 49, 53, 84 and 94, all by less than 0.05 -- the count moves with run-to-run noise more than the score does. Cost: 641 s per design on average (405 s), up to 3,007 s on design 99. Now the default."
+  ],
+  [
+   "The 10 largest designs (10/18)",
+   "Designs 90-99 carry 57% of the contest weight. Weighted 1.029 against the ground truth's 1.082; better than the ground truth on 8 of the 10, and five of them (92, 93, 95, 97, 98) score exactly 1.000 -- the best possible. The two losses: 90 (1.188 vs 1.031, better than 1.270 on 10/17) and 94 (1.104 vs 1.097). big_designs_1018.pdf shows each of the 10 next to the ground truth."
+  ],
+  [
+   "Second packer round from the winner (10/16 - 10/17)",
+   "A breakdown of the 10/16 run showed that soft-constraint violations are now as large a loss as wirelength and area together: with our violations removed (same wirelength and area), we would beat the ground truth on 85 designs instead of 72 and score 1.0246. Most of our 38 edge violations are blocks sitting just past the chip outline that a preplaced edge block reveals (several by less than 1%). Two changes. (1) The packer's search can add a penalty for running past that outline (search only, the score is unchanged). (2) After the usual finish, the winning layout gets one more packer round from where it ended, with that penalty, and is kept only if its exact cost is lower. Offline, starting from the 10/16 layouts: the second round improved 27 of 100 designs and made none worse; the penalty itself removed the violation on design 17 (1.099 -> 1.031). Official: 1.0432 -> 1.0404, HPWL gap 0.017 -> 0.013, area gap 0.035 -> 0.025, vrel 0.010 -> 0.008, designs with any violation 30 -> 26. Better than the ground truth's own score on 77 of 100 designs (was 72): new wins on 25, 49, 53, 92 and 94, none lost; 66 designs better than on 10/16, 28 worse (run-to-run noise both ways). Cost: 405 s per design on average (was 210 s), up to 1,002 s on the largest. Now the default."
+  ],
+  [
+   "Learned repair network (10/16 - 10/17)",
+   "The 10/16 diagnosis found that our losses on 54, 61, 70 and 90 come from the arrangement: the relation networks get ~94% of block pairs right, which is about as damaging as 5 randomly misplaced blocks, and the packer cannot undo even 2. We trained a repair network (the relation network plus each block's current position and size, and the input layout's own pair relations) to predict the ground truth's arrangement from a flawed layout: deliberately corrupted ground-truth layouts and our own packed layouts, 280k designs in ~8 h. It learned to repair corrupted layouts well (5 blocks moved: 1.236 -> 1.088 after one repair round, 8 hard designs) and reached 92.1% relation accuracy on our own layouts (92.0% before training), but on our own layouts it does not lower the final cost (1.153 -> 1.162 after one round, 1.165 after two). An early result that looked like a gain (1.145 -> 1.100) was packer noise. Kept in the code as an optional candidate, off by default."
+  ],
+  [
+   "What did not help (10/16 - 10/17)",
+   "Reshaping soft blocks to fit inside the outline (shape fitting with a strong outline penalty, and a step-by-step narrowing of the blocks on the critical chains): no design changed -- these layouts are tight in both directions, so narrowing a block pushes the layout past the top instead. A pull toward the relation network's predicted centres during the packer search (worse on the 10 loss designs: 1.166 -> 1.190 / 1.201)."
+  ],
+  [
+   "Cluster violations fixed (10/15 - 10/16)",
+   "12 of the 10/15 layouts left one cluster member detached (14 violations); the ground truth does so on only one of those designs. Two changes. (1) An exact repair after every packer run: each detached member tries every free spot where it touches another part of its cluster (sliding along each side, other aspect ratios for soft blocks, shapes stretched to close the gap), scored with the exact contest cost and kept only if cheaper -- it can never make a layout worse (<0.2 s). On the saved 10/15 layouts alone: 14 -> 8 violations. (2) The remaining cases have other blocks between the pieces, so the packer search now adds a penalty for the distance between a cluster's pieces (search only; the score is unchanged). On the 12 affected designs: no penalty 1.120 (7 beat the ground truth), penalty 1 1.086 (9), penalty 3 1.090 (8), against 1.120 (6) before; violations 14 -> 2 with penalty 1. On the 10 largest designs, which had no cluster problem, it is neutral (1.0351 vs 1.0354). Now the default. Official: cluster violations 14 (12 designs) -> 6 (5 designs: 25, 53, 54, 59, 70); 1.0451 -> 1.0432, HPWL gap 0.022 -> 0.017, vrel 0.011 -> 0.010, area gap 0.031 -> 0.035; size-weighted HPWL 0.033 -> 0.021 and area 0.016 -> 0.021; large designs 1.042 -> 1.041. Better than the ground truth's own score on 72 of 100 designs (was 68): new wins on 5, 6, 41, 75 and 84, one lost (43)."
+  ],
+  [
+   "Longer soft blocks allowed (10/12 - 10/15)",
+   "Soft blocks may now be shaped up to 16:1 instead of 8:1 in the polish, packer and shape fitting. On the 10 largest designs: 1.0386 -> 1.0354. Official: 1.0465 -> 1.0451, area gap 0.036 -> 0.031, large designs 1.043 -> 1.042; size-weighted, area improved (0.022 -> 0.016) and wirelength got worse (0.023 -> 0.033). Better than the ground truth's own score on 68 of 100 designs (72 in the 10/11 run): designs flip both ways between runs (design 17: 1.035 then 1.119), so the count difference is run-to-run noise rather than the change. Now the default."
+  ],
+  [
+   "What did not help (10/13 - 10/15)",
+   "More packer restarts on the 10 largest designs, against 1.0354 for one run per candidate: 6 runs in the same time 1.0395, 12 runs (twice the time) 1.0345, twice the search time per run 1.0409 -- all within the ~0.01 noise. Extra search no longer pays; the defaults stay."
+  ],
+  [
+   "Where we still lost to the ground truth (10/15)",
+   "32 designs remain worse than the ground truth's own score, 18 of them by less than 0.03. Four can only be tied: the score cannot go below 1.000, and the ground truth scores exactly 1.000 on designs 2, 23, 32 and 39, so 96 is the most we can win. Taking each design's best of the last three official runs would beat the ground truth on 76. Violations: the ground truth breaks edge constraints on most designs we lose (often more often than we do), so edge violations are not the reason. Cluster (grouping) violations are: 12 of our layouts leave one cluster member detached, and the ground truth does so on only one of those designs. Removing that one violation would turn designs 5, 6 and 53 into wins and lower the cost on six designs we already win. Largest weighted losses: design 90 (111 blocks, 1.224 vs 1.031: wirelength 24% over), 94 (1.122 vs 1.097), 92 (1.065 vs 1.036), 70 (1.194 vs 1.070) and 61 (1.287 vs 1.139)."
+  ],
+  [
+   "More search and a second relation network (10/11)",
+   "Three official runs over the night showed large run-to-run variation: taking each design's best of the three would score 1.046. So the solver now searches longer (packer budget 200 instead of 100) and adds a second relation network, trained independently (other seed, from the 256x8 placer) so its mistakes differ from the first. Official: 1.0575 -> 1.0465, HPWL gap 0.036 -> 0.023, area gap 0.033 -> 0.022 (size-weighted), large designs 1.054 -> 1.043; better than the ground truth's own score on 72 of 100 designs (was 66); 0.037 ahead of the leaderboard leader (1.084)."
+  ],
+  [
+   "What did not help (10/10 - 10/11)",
+   "Training the relation network longer (358k designs): validation error improved (0.050 -> 0.049) but the official score got worse (1.0709) -- validation error does not track the final cost. Tightening the pin box to the edges revealed by right/top-pinned preplaced blocks (the true outline; 40 of our 58 remaining violations are such blocks just past it): neutral on 12 large designs, off."
+  ],
+  [
+   "Where we still lost to the ground truth (10/11)",
+   "28 designs remain worse than the ground truth's own score. The largest weighted losses: design 90 (111 blocks, 1.205 vs 1.031: wirelength 16% and area 11% over), 70 (1.205 vs 1.070), 61 (1.315 vs 1.139: wirelength 31% over) and 54 (1.341 vs 1.085: wirelength, area and violations). These are arrangement problems -- the target of the next work."
+  ],
+  [
+   "Honest reward: which cheap score tracks the final cost? (10/9)",
+   "The 10/8 RL fine-tuning of the placer failed because its reward (the raw packed layout) barely tracked the final cost. A measurement on 34 designs x 8 sampled arrangements: rank correlation with the true final cost 0.38 for that reward, 0.43 with a short shape fit, 0.54 with shape fit + 1 s of packing; the best of 8 samples beats the plain prediction on 26/34 designs (by 0.098). Picking samples with the best cheap score in the solver ('sample-and-rank') was neutral officially (1.0801 vs 1.0815): the full packer evens out variants of the same arrangement -- what matters is a better arrangement."
+  ],
+  [
+   "Block relations: predicting the arrangement in the packer's own language (10/9)",
+   "The placer now also predicts, for every pair of blocks, their relation in the arrangement (left of / right of / below / above -- exactly what the packer's sequence pair encodes), trained on the ground-truth layouts; validation accuracy 91% after 50k designs. The sequence pair comes straight from these predictions (each block ranked by its probability of coming first). Learning relations also made the centre predictions better (1.185 -> 1.167 with packer 6). Relations win on the large designs, centres on small / medium ones, so both are candidates. Official: 1.0815 -> 1.0727 (HPWL gap 0.040 -> 0.034, large designs 1.084 -> 1.077) -- the first step past the ~1.08 plateau of four runs. More training (312k designs, relation accuracy 92%, centre error 0.050) improved both modes (packer-6 test: relations 1.159 -> 1.141, centres 1.167 -> 1.141) and the official score again: 1.0727 -> 1.0575 (area gap 0.054 -> 0.044, large designs 1.077 -> 1.064, 10 layouts past the pin box instead of 17)."
+  ],
+  [
+   "Larger placer network (10/9)",
+   "A 256-wide, 8-layer placer at first did not learn (outputs saturated); averaging the network's messages by edge weight and layer normalization fixed it (validation error 0.052, best of all runs). The relation network builds on it."
+  ],
+  [
+   "What did not help (10/8 - 10/9)",
+   "RL fine-tuning with the raw-layout reward (validation got worse; kept the starting weights); a fourth checkpoint of the same run; shape refit inside the packer (score neutral, fewer layouts past the pin box: kept); sampled arrangements ranked by a cheap score (neutral, off)."
+  ],
+  [
+   "The ground truth is not 1.0 on the contest score (10/7)",
+   "Scored by the contest evaluator, the ground-truth layouts themselves average 1.108 weighted: they break 219 edge-pin and 10 cluster constraints over the 100 designs, and violations count in full (only their wirelength and area define 1.0). So 'beating the ground truth' on the score means getting below 1.108; the leaderboard leader (1.084) already does."
+  ],
+  [
+   "Diagnosis: arrangement + shapes, not the packer (10/7)",
+   "Started from the exact ground-truth layout, our packer reaches 1.016 (it keeps the area, slightly improves the wirelength and repairs nearly all edge violations) -- the optimizer is good enough. With the ground truth's arrangement but soft shapes off by ~20%, it only reached ~1.24: shapes decide area and violations, arrangement decides wirelength."
+  ],
+  [
+   "A: shape fitting for a given arrangement (10/7)",
+   "New rl/sizing.py: keeps the arrangement (sequence pair) and optimizes every soft block's aspect ratio by gradient descent on a differentiable packing, with the contest cost plus edge-pin, preplaced-collision and cluster terms. Ground-truth arrangement with shapes off by ~20%, then fitting + packer: 1.048 weighted on all 100 designs (anchors 0 / 49 / 98: 1.000 / 1.087 / 1.021), i.e. below the ground truth's own 1.108 and the leader's 1.084. On our own layouts it changes little (their shapes are already tuned to their arrangement) -- it is the step that turns a good arrangement into a tight layout."
+  ],
+  [
+   "B: learned placer, trained on 1M ground-truth layouts (10/8)",
+   "The training set includes the full ground-truth layout of every design, never used for learning before (RL only saw its own cost). A graph network (the policy's netlist encoder, 6 layers, 128 wide) reads a design and predicts every block's centre in pin-box units plus its aspect ratio, trained to match the ground truth (~1,900 designs per minute; validation centre error 0.92 -> 0.061 in 7 h, 0.067 for the snapshot used here). Its prediction becomes a sequence pair, then shape fitting (A). Alone it beats the full pipeline on 36 of 99 designs with much better wirelength (HPWL gap 0.068 vs 0.110). As a 7th best-of candidate (always packed): official 1.1232 -> 1.1027, HPWL gap 0.110 -> 0.076, better on 59 designs. Two checkpoints of the same training run (at ~290k and at 910k designs) make different mistakes: each alone ~1.21, the better of the two per design 1.164 (packer 6). Both as candidates: official 1.1027 -> 1.0924, HPWL gap 0.076 -> 0.058, better on 64 designs. A second training run (other seed, half the learning rate; the first attempt with another seed never learned and was stopped) gave a third placer: alone the best of the three, better-of-three per design 1.141 vs 1.164 for two. All three as candidates: official 1.0924 -> 1.0795 (HPWL gap 0.058 -> 0.041)."
+  ],
+  [
+   "C: more packer time (10/8)",
+   "Packer budget 40 -> 100 per candidate (at 77 blocks): big designs 1.150 -> 1.135; official 1.1358 -> 1.1232."
+  ],
+  [
+   "Pin box: in-box within 5% of the best (10/7)",
+   "'Always in-box' sometimes picked much worse layouts (design 38: 1.400 inside vs 1.149 slightly outside). Now an in-box layout wins only if it costs at most ~5% more: 87 of 100 inside (13 slightly past), score 1.1482 -> 1.1358 at equal settings. Escalating the penalty for the tight designs fixed none of them and is off."
+  ],
+  [
+   "Wirelength moves (10/7)",
+   "Cluster members may now move in the wirelength relaxation as long as their cluster stays connected (tiny gain, never worse); a packer move that swaps a block with the block at its nets' weighted centre (15% of swaps; weak evidence, ~-0.01)."
+  ],
+  [
+   "Big designs: far more packer search (10/7)",
+   "The 21 designs with 100+ blocks carry 83% of the weighted score (the 11 with 110-120 blocks alone 60%). Packer search time turned out to be the strongest lever: on those designs (weighted total over all 100) 1.5 s -> 1.225, 6 s -> 1.192, 15 s -> 1.170, 40 s + squeeze -> 1.147 (per candidate at 77 blocks, scaled by (blocks/77)^2; ~90 s per big design). Area gap on the big designs 0.165 -> 0.079. Now the default (FLOORSET_PACK=40); still improving with more time."
+  ],
+  [
+   "Squeeze: soft blocks reshaped into free room (10/7)",
+   "Bottom-left packing leaves white space beside the critical columns (design 99: 165 wide vs 130 in the ground truth). The squeeze keeps the arrangement and, round by round, widens soft blocks on the height-critical path into free room to their right (so they get shorter), or heightens those on the width-critical path; every variant is packed exactly and the best kept while the cost drops. Same layouts: weighted 1.2250 -> 1.2203, area gap 0.146 -> 0.141, never worse, 0.15 s."
+  ],
+  [
+   "Nothing below or left of the box (10/7)",
+   "81 of 100 layouts had blocks below or left of (0, 0) (designs 0 and 49 in the last report). The packer now packs from the origin: a repair step first moves each block that runs into a preplaced block to another side of it, until the packing fits (81 of 81 layouts repaired, < 0.3 s), then the search runs inside the box and the solver prefers in-box results. Official: 0 of 100 layouts below or left of the box (was 81), and the score improved (1.1352 -> 1.1318; area gap 0.086 -> 0.079). The 10/6 attempt, which restricted the placer and slicing instead, cost 0.04 and is kept off (FLOORSET_ORIGIN_UPSTREAM)."
+  ],
+  [
+   "Inside the pin box: top and right edges too (10/7)",
+   "The pins sit on the true outline, so the ground truth never goes past the pins' highest x / y; 52 of our 100 layouts did (up to 24%). There was room (blocks fill 69-93% of the pin box): the overshoot was the overall shape, e.g. design 80 came out 172 x 178 against a 139 x 240 box. Two changes: slicing now also tries outlines with the pin box's shape, and the packer penalizes running past the box and prefers in-box layouts. Official: 92 of 100 inside (8 still past by 1-10%), area gap 0.079 -> 0.068; the contest score gives up 0.016 (1.132 -> 1.148: wirelength 0.105 -> 0.121, violations 0.014 -> 0.020), kept as the default because a layout inside the box is the goal. A stronger penalty fits more but costs much more (design 4: 1.315 -> 1.536)."
+  ],
+  [
+   "Packer speed-ups (10/7)",
+   "Parallel nets between the same two blocks merged, pin nets evaluated from sorted pin positions with prefix sums, and the packing loop and wirelength gathers in a blocks x batch memory layout: identical results, 1.8x more search steps per second on the largest design."
+  ],
+  [
+   "Wirelength relaxation (10/6 evening)",
+   "The packer leaves every block at the low end of its free slack. A final pass keeps the layout's arrangement and outline and slides each block, one axis at a time, toward the weighted median of what it is wired to (the exact best spot on that axis), within its slack. Pinned, preplaced and cluster blocks stay put, so no new violations. Same layouts: weighted 1.2335 -> 1.2308, 98/100 designs better, ~50 ms per design. Official rerun: 1.2250 (the extra ~0.005 is run-to-run noise)."
+  ],
+  [
+   "Preplaced walls: why the outline can't be hit (10/6 evening)",
+   "Nine designs reveal the full true outline through pinned preplaced blocks (16% of the weight) and all of them overshoot it. Their block area is 96-100% of that outline: the ground truth has 0-4% white space, ours ~15%. Tried: slicing at the true outline (overlap only 2-8%, but the legalizer then blows the layout up), slicing turned into a sequence pair and packed (fits on 2 of 9; design 12: 1.296 -> 1.151), reshaping soft blocks on the critical paths, a continuous optimizer of positions and shapes under the outline, and a packer wall penalty for 15 s. None fits the big designs, so nothing went into the solver."
+  ],
+  [
+   "Weighted score",
+   "The official total weights each design by exp(blocks/12): the 116-120-block designs carry ~34% of it. Our larger designs were our weakest, so every result is now also reported as the weighted score, and time is spent where the weight is."
+  ],
+  [
+   "Constraint repair (edge pins, clusters, grouped shapes)",
+   "A diagnosis of every candidate at every stage found 112 edge, 100 cluster and 44 grouped-shape (MIB) violations in the 100 best-of results. Slicing gave soft group members a different shape from the group's fixed member (fixed: 44 -> 4); a new repair pass moves blocks that stick out past the outline into free holes and reattaches cut-off cluster members (cluster 100 -> 69). Weighted 1.466 -> 1.421."
+  ],
+  [
+   "Compact packer (sequence pair)",
+   "A new search on the contest cost from the best layouts: the layout is converted exactly into a sequence pair (the classic compact floorplan representation), then annealing swaps / moves / reshapes blocks, scoring 32 moves at once with numpy. Half the moves put a block next to a block it is wired to or clustered with. Weighted 1.421 -> 1.323 from the best candidate alone."
+  ],
+  [
+   "More starting layouts",
+   "Packing several candidates beats packing one for longer (top 3 x 1.5 s 1.248 vs best x 4.5 s 1.253, cached). Six candidates (analytic placer at utilization 0.75-1.0 plus the policy; each is the best start on 12-21 of 100 designs), best four packed: weighted 1.252."
+  ],
+  [
+   "Time where the weight is",
+   "Packer time per candidate scales with (blocks/77)^2 (0.25 s for the smallest designs, ~3.6 s for 120 blocks; flat 1.250, linear 1.236, quadratic 1.229 on cached layouts), and the placer runs 600 iterations instead of 250. Weighted 1.208."
+  ],
+  [
+   "Parallel workers",
+   "The six candidates and four packer runs are independent, so they run in a pool of worker processes: the largest designs went from ~35-40 s to ~13 s with the same result (FLOORSET_PROCS=1 runs them in-process)."
+  ],
+  [
+   "Tried and rejected (10/5-10/6)",
+   "Tetris-style legalizer for the analytic placer (packs tighter, loses on wirelength: 1.432 vs 1.368); biasing the legalizer toward stacking (fits the width only by growing much taller); true outline in the placer (1.362 vs 1.354); a packer penalty pulling layouts inside the outline that preplaced blocks reveal, and an edge-thinning move (no gain); nine candidates instead of six (1.205 vs 1.207, +3 s)."
+  ],
+  [
+   "~6x faster solve: 2 s fine-tune + 1 s polish",
+   "Fine-tuning and polish both level off quickly, and the official score multiplies cost by max(0.7, (runtime/median)^0.3). A budget sweep on 100 designs: 20+8 s 1.607 @ 28.9 s, 10+4 s 1.626, 5+3 s 1.634, 2+1 s 1.643 @ 4.3 s. 2+1 s wins for any median runtime of 10 s or more; the fine-tune budget is now a hard deadline."
+  ],
+  [
+   "Slicing re-pack (new polish stage)",
+   "Rebuilds the RL layout as a slicing floorplan (guillotine cuts in RL order, soft blocks at their exact area, clusters kept together, preplaced blocks as obstacles), then the re-pack. 100 designs at 2+1 s: 1.643 -> 1.554."
+  ],
+  [
+   "Boundary fixes in the re-pack",
+   "A final pass snaps blocks still off their required edge; the re-pack keeps whichever of the compacted / uncompacted layouts scores better, and edge snaps may no longer push the layout past the origin (soft blocks reshape to fit instead)."
+  ],
+  [
+   "Live frame: shrinking the canvas during placement",
+   "Placement starts in a frame sized for 80% utilization inside the canvas and grows only when a block fits nowhere. Area gap 0.25 -> 0.21, but wirelength and edge violations rose; retrained 4,000 iterations: 1.582 vs 1.545 installed."
+  ],
+  [
+   "Large blocks first + stronger wirelength reward",
+   "Frame growth was triggered by large blocks placed late (90% of growths). Ordering the largest 40% first cut growths 75% and area gap to 0.19; doubling the wirelength term in the training reward recovered most of the lost HPWL (1.647 -> 1.576), still short of the installed policy."
+  ],
+  [
+   "From-scratch retrain with the live frame",
+   "A fresh 20,000-iteration run with the live frame (17 h). All 40 checkpoints were scored on the 100 designs: the best four (iterations 14,000, 6,000, 12,500, 5,500) average 1.580-1.586 over 4 runs each; the installed policy averages 1.551. Area gap 0.19-0.20 vs 0.25, but HPWL gap ~0.48 vs 0.43 and slightly more soft violations. Not installed."
+  ],
+  [
+   "Analytic placer + best-of (new solve stage)",
+   "A classical global placer (gradient descent on smoothed wirelength with an overlap penalty that ramps up, edge and cluster terms, preplaced blocks fixed) produces extra candidate layouts; each is legalized and polished, and the solver keeps the one with the lowest contest cost, judged without ground truth. Alone the placer is worse (1.64-1.95) but it wins on different designs: policy + 2 placements, 100 designs: 1.548 -> 1.431 (HPWL gap 0.43 -> 0.31), ~8 s per design. Now the default."
+  ],
+  [
+   "Policy architecture test (3 arms, 4,000 iterations each)",
+   "Same data and seed: A = current network, B = whole-canvas position network, C = B + the placer's 'where blocks want to be' map. Full pipeline, 3 runs each: A 1.528, B 1.672, C 1.706. The wider view did not help at this training length (HPWL gap 0.61-0.63 vs 0.41)."
+  ],
+  [
+   "New installed policy",
+   "Arm A at iteration 4,000 (learning rate decayed fully within the short run) beats last week's iteration-12,000 policy: 1.528 vs 1.551 with the old polish, 1.424 vs 1.432 with best-of (2 runs each). Installed 10/5; the old policy is kept as policy_installed_0928_iter12000.pt. Arm A is being continued to 20,000 iterations."
+  ],
+  [
+   "Engineering",
+   "Every 500 iterations the anchors run 3x (median reported, single runs vary by up to 0.4); a greedy 100-design score every 1,000 iterations and a full-pipeline score every 2,000 give a steadier view of training (the greedy score has no run-to-run noise)."
+  ],
+  [
+   "Tried and rejected",
+   "Canvas sized from the die dimensions that preplaced blocks reveal (no retrain: 1.849 -> 1.944 on the 47 affected designs); a per-design pull-back and two other slicing variants for layouts that run past the origin (fix design 0's offset, but net cost +0.005 to +0.06 on 100 designs); 'connected-only' and scaled big-first ordering (no better than plain big-first). Not finished: retrains scored on the slicing-packed layout and with edge-pinned blocks placed last (stopped by a reboot / a crash)."
+  ]
+ ],
+ "progress_note": "Full pipeline (2 s fine-tune + 1 s polish) on 100 designs, scored while training ran (quiet re-runs of 10k / 14k / 20k: 1.597 / 1.584 / 1.605). Installed policy, same pipeline: 1.552. Cost stopped improving after ~6,000 iterations even though the training reward kept rising.",
+ "next_title": "Where we are, and what's next",
+ "next": [
+  [
+   "Where we are",
+   "Official evaluator, 100 designs: weighted score 1.0343 (9/28 1.619, 10/6 1.225, 10/8 1.0795, 10/10 1.0575, 10/11 1.0465, 10/15 1.0451, 10/16 1.0432, 10/17 1.0404); ground truth as scored 1.108; leader 1.084 on the 10/6 board. HPWL gap 0.019, area gap 0.025, vrel 0.004; all feasible; better than the ground truth's own score on 76 of 100 designs and on 8 of the 10 largest; 641 s per design on average."
+  ],
+  [
+   "Why we still lose to the ground truth",
+   "24 designs remain worse than the ground truth's own score, 15 of them by less than 0.03 (6 by less than 0.01); four (2, 23, 32, 39) can only be tied, since the ground truth scores exactly 1.000 there. Taking each design's best of the last five official runs would beat the ground truth on 82. Largest weighted losses: design 90 (111 blocks, 1.188 vs 1.031), 70 (1.175 vs 1.070), 94 (1.104 vs 1.097), 54 (1.256 vs 1.085) and 69 (1.120 vs 1.080). Violations are no longer the reason: on every one of the 24 losses we have no more violations than the ground truth (13 have none at all); we lose on wirelength and area -- the arrangement."
+  ],
+  [
+   "1. Arrangement",
+   "The large losses (90, 70, 54, 61) are arrangement problems. The repair network fixes corrupted layouts but not our own; next: train it on many more of our own layouts, or with a reward from the final cost instead of the ground truth's relations."
+  ],
+  [
+   "2. Run-to-run variation",
+   "Best of five runs would win 82 designs vs 76-77 for one run. Restarting only when violations remain captured part of it; a GT-free signal for 'this run's arrangement is poor' would let restarts target wirelength and area losses too."
+  ],
+  [
+   "3. Runtime",
+   "641 s per design on average (up to 50 min on the largest); can be cut later, quality is the focus."
+  ]
+ ],
+ "pick_note": "All 40 checkpoints of the from-scratch run (every 500 iterations) were scored with the full pipeline (2 s fine-tune + 1 s polish) on the 100 designs, one at a time on a quiet machine. The best four were then run 3 more times, next to the installed policy. Run-to-run noise is about +-0.01; the installed iteration-12000 policy stays ahead by ~0.03 and remains the policy in use.",
+ "review_title": "The policy in use: how it works",
+ "review": [
+  [
+   "What it is",
+   "checkpoints/policy.pt = iteration 4,000 of a fresh training run started 10/4 (arm A of the architecture test), ~74,000 parameters, trained with PPO on the 1M-design training set against the contest cost (wirelength and area credited per placement, violations at the end), canvas schedule 0.60 -> 0.70, learning rate 3e-4 decayed to 3e-5 within the 4,000 iterations. Replaced the 9/28 policy (iteration 12,000)."
+  ],
+  [
+   "What it decides",
+   "Blocks are placed one at a time. For each block the policy picks a shape (one of 9 aspect ratios, 0.2-5.0) and a position (a cell on a 32-96 grid, free space tracked 4x finer). Placement order, the canvas size and all hard constraints (overlap, required edges, cluster contact, grouped shapes, 'the next 3 largest blocks must still fit') are fixed code; the policy only chooses among legal moves."
+  ],
+  [
+   "What it sees",
+   "A graph network reads the whole netlist once and gives each block a summary vector plus one for the design. Each step adds three maps (occupancy, cluster-mates, and a wiremask: the wirelength cost of every cell given what is already placed) and 7 numbers about what is still to come."
+  ],
+  [
+   "How it is used at solve time",
+   "2 s of PPO fine-tuning on the design gives the policy layout; five analytic placements (utilization 0.75-1.0) are the other candidates. Each gets 1 s of slicing re-pack + constraint-graph re-pack with the edge/cluster repair; the best four by contest cost (no ground truth needed) then go through the compact packer, and the cheapest result wins. Candidates and packer runs execute in parallel worker processes."
+  ],
+  [
+   "Strengths",
+   "Always legal; fast; best wirelength of anything trained so far."
+  ],
+  [
+   "Weaknesses",
+   "Fills whatever canvas it is given (canvas ~1.4x the ground-truth area); cannot see blocks not yet placed, so large blocks placed late force a spread layout; right/top-pinned blocks can end up past the pin box (design 98 with the 9/28 policy). The position network judges each cell from only a 5x5-cell neighbourhood (two 3x3 convolutions), about 1% of a 48x48 canvas; everything else arrives as one design summary that is the same for every cell. The shape head does not see the maps at all."
+  ]
+ ],
+ "proposals_title": "Proposed improvements to the policy",
+ "proposals": [
+  [
+   "1. Whole-canvas view in the position network",
+   "Add downsampling / dilated layers (U-Net style) so every cell's score reflects the shape of the free space and the current outer edge, not just its 5x5 neighbourhood. Targets leftover holes, late large blocks finding no room, and layouts spreading outward, i.e. area. Tested 10/4 (arm B): 1.672 vs 1.528 for the current network after 4,000 iterations; it may need much longer training, not pursued for now."
+  ],
+  [
+   "2. A map of where unplaced blocks will pull",
+   "Add an input channel estimating where connected but not yet placed blocks want to sit. Only useful with the wider view from 1. Targets the wirelength loss that every tighter-packing setup this week ran into. Tested 10/4 (arm C, with the wider view): 1.706, worse than B."
+  ],
+  [
+   "3. Let the shape choice see the space",
+   "Feed the shape head the same map features as the position head, so aspect ratios are picked to fill the space that is actually there."
+  ],
+  [
+   "4. Train the tight-packing setup from scratch",
+   "Live frame + large blocks first + doubled wirelength reward came closest this week (1.576 after a 4,000-iteration fine-tune). Combine with 1-3."
+  ],
+  [
+   "Cost and how we test it",
+   "1-3 need a new network and a from-scratch run (~17 h or more; each step does more CPU work, and solve-time fine-tuning slows slightly). Better raw policies have not always survived fine-tune + polish, so first train the new network for ~4,000 iterations next to the current one (same data and seed) and compare on the 100 designs; continue to a full run only if it is clearly ahead."
+  ]
+ ],
+ "continuation_title": "Does more training help? Arm A continued past 4,000 iterations",
+ "continuation_note": "After installing arm A's iteration-4,000 checkpoint, the same run continued toward 20,000 iterations (learning rate restarted at 2.7e-4). It was stopped at 14,620 by a machine restart on 10/5. Nothing moved: the training reward stayed between -2.8 and -3.2, the 100-design greedy cost stayed in a 1.81-1.93 band with no trend (4,000: 1.834; best 12,000: 1.808), and the anchor-design average (median of 3 runs per snapshot) bounced between 1.55 and 1.67. The from-scratch run of 10/3 behaved the same way (none of its 40 checkpoints beat the policy installed then). Conclusion: with this network and setup the policy stops improving at about 4,000 iterations; further gains have to come from the solve stage or from a different policy design, not from longer training.",
+ "leaderboard_note": "Published leaderboard (leaderboard_1006.csv) re-sorted by cost: the raw score, i.e. the weighted contest cost before the runtime factor, the same measure as the tables in this report (1.0 = matches the ground truth's wirelength and area; the ground truth itself scores 1.108 because of its own violations). Team ICB's 1.0343 (10/18) places 1st of 11, 0.050 ahead of the leader (1.084) -- well beyond the run-to-run noise (~+-0.01) -- measured against the 10/6 leaderboard; other entries may have improved since. Not shown: the official total also multiplies by a runtime factor; team ICB's solver (641 s per design) is much slower than the leaders and can be sped up later -- quality is the focus."
+}
